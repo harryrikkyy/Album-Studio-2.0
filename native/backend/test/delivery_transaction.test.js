@@ -1093,6 +1093,28 @@ test('an interrupted lock reclamation fails closed and preserves its guard witho
   assert.equal(fs.existsSync(path.join(f.stage, 'journal.json')), false)
 })
 
+test('a recovery beaten to the reclamation guard fails closed and keeps that guard', async (t) => {
+  const f = await fixture(t)
+  await killedAt(f, 'new-install')
+  const guard = path.join(path.dirname(f.paths.cache), '.delivery.recovery.lock'),
+    open = fs.promises.open.bind(fs.promises)
+  t.mock.method(fs.promises, 'open', async (file, ...args) => {
+    if (file === guard) fs.writeFileSync(guard, 'another recovery')
+    return open(file, ...args)
+  })
+  await assert.rejects(recoverDeliveries(f.paths, { albumFile: f.albumFile }), (error) => {
+    assert.equal(
+      error.message,
+      `Delivery lock recovery is already in progress, or was interrupted. Preserve and inspect ${guard} before retrying.`,
+    )
+    assert.equal(error.recoveryLock, guard)
+    return true
+  })
+  assert.equal(fs.readFileSync(guard, 'utf8'), 'another recovery')
+  assert.equal(fs.readFileSync(f.targets[0], 'utf8'), 'next delivery 0')
+  assert.deepEqual(fs.readFileSync(path.join(f.stage, 'backup-0')), f.previous[0])
+})
+
 test('a real SIGKILL during stale-lock reclamation preserves the guard and all delivery recovery data', async (t) => {
   const f = await fixture(t)
   await killedAt(f, 'new-install')

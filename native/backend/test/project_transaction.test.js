@@ -284,3 +284,101 @@ test('a save stage whose journal is not JSON is kept, and the save names it', as
   assert.deepEqual(fs.readFileSync(f.file), f.old)
   assert.equal(fs.readFileSync(path.join(stage, 'journal.json'), 'utf8'), '{not json')
 })
+
+// A save that committed but couldn't retire its stage, which keeps the stage in place.
+async function committedStage(t, f) {
+  const { saveProject } = require(modulePath),
+    exclusive = require('../lib/exclusive_rename'),
+    rename = exclusive.renameExclusive
+  let stage
+  t.mock.method(exclusive, 'renameExclusive', async (from, to) => {
+    if (path.basename(path.dirname(to)) !== 'history') return rename(from, to)
+    stage = from
+    throw Object.assign(new Error('Simulated history disk failure'), { code: 'ENOSPC' })
+  })
+  await assert.rejects(saveProject(f.file, f.data, revision(f.old), context), /project was saved/i)
+  exclusive.renameExclusive.mock.restore()
+  return stage
+}
+
+test('a damaged commit marker stops recovery and leaves the saved project in place', async (t) => {
+  const { recoverProject } = require(modulePath)
+  for (const [bytes, message] of [['{not json', 'The project commit marker is invalid.']]) {
+    const f = fixture(t),
+      stage = await committedStage(t, f),
+      marker = path.join(stage, 'commit.json'),
+      { mode } = fs.statSync(marker)
+    fs.chmodSync(marker, 0o600)
+    fs.writeFileSync(marker, bytes)
+    fs.chmodSync(marker, mode)
+    await assert.rejects(recoverProject(f.file, context), (error) => {
+      assert.equal(
+        error.message,
+        `${message} Project recovery evidence is retained at ${stage}.` +
+          ` Keep that folder and the current project/backup before retrying.`,
+      )
+      assert.equal(error.recoveryStage, stage)
+      return true
+    })
+    assert.equal(JSON.parse(fs.readFileSync(f.file)).marker, 'new project')
+    assert.deepEqual(fs.readFileSync(`${f.file}.bak`), f.old)
+    assert.equal(fs.readFileSync(marker, 'utf8'), bytes)
+  }
+})
+
+// The directory sync after a move fails: the move has happened, but the caller sees it fail.
+function syncFailsAfterMove(t, moved) {
+  const exclusive = require('../lib/exclusive_rename'),
+    rename = exclusive.renameExclusive,
+    open = fs.promises.open
+  let armed = false
+  t.mock.method(exclusive, 'renameExclusive', async (from, to) => {
+    const result = await rename(from, to)
+    if (moved(to)) armed = true
+    return result
+  })
+  t.mock.method(fs.promises, 'open', async function (...args) {
+    if (!armed) return open.apply(this, args)
+    armed = false
+    throw Object.assign(new Error('injected directory sync failure'), { code: 'EIO' })
+  })
+}
+const stageNames = (f) => {
+  const metadata = fs.readdirSync(f.folder).find((name) => name.startsWith('.album-studio-project-state-'))
+  return fs.readdirSync(path.join(f.folder, metadata)).filter((name) => name.startsWith('save-'))
+}
+
+test('a save whose stage move fails its sync is rolled back and reported as not saved', async (t) => {
+  const { saveProject } = require(modulePath),
+    f = fixture(t)
+  syncFailsAfterMove(t, (to) => /^save-/.test(path.basename(to)) && path.basename(path.dirname(to)) !== 'history')
+  await assert.rejects(saveProject(f.file, f.data, revision(f.old), context), (error) => {
+    assert.equal(error.message, 'injected directory sync failure')
+    assert.deepEqual([error.code, error.projectCommitted, error.revision], ['EIO', undefined, undefined])
+    return true
+  })
+  t.mock.restoreAll()
+  assert.deepEqual(fs.readFileSync(f.file), f.old)
+  assert.deepEqual(stageNames(f), [])
+})
+
+test('a save whose commit marker move fails its sync is reported as saved', async (t) => {
+  const { saveProject } = require(modulePath),
+    f = fixture(t)
+  syncFailsAfterMove(t, (to) => path.basename(to) === 'commit.json')
+  await assert.rejects(saveProject(f.file, f.data, revision(f.old), context), (error) => {
+    assert.equal(
+      error.message,
+      'The project was saved, but recovery evidence needs review. injected directory sync failure',
+    )
+    assert.deepEqual(
+      [error.code, error.projectCommitted, error.revision],
+      ['EIO', true, revision(fs.readFileSync(f.file))],
+    )
+    return true
+  })
+  t.mock.restoreAll()
+  assert.equal(JSON.parse(fs.readFileSync(f.file)).marker, 'new project')
+  assert.deepEqual(fs.readFileSync(`${f.file}.bak`), f.old)
+  assert.deepEqual(stageNames(f), [])
+})

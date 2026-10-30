@@ -1060,3 +1060,101 @@ test('a render folder with more than 10000 entries stops with a plain message an
   )
   assert.equal(fs.readdirSync(metadata).length, 10001)
 })
+
+test('a damaged commit marker stops recovery and leaves the published pair in place', async (t) => {
+  const { recoverRenders } = require(modulePath)
+  for (const [bytes, message] of [
+    ['{not json', 'The render commit marker is invalid JSON.'],
+    ['null', 'The render commit marker does not match the exact journal revision.'],
+  ]) {
+    const f = fixture(t),
+      p = await input(f)
+    await killed(f, p, 'commit')
+    const [stage] = pending(f),
+      marker = path.join(stage, 'commit.json'),
+      { mode } = fs.statSync(marker),
+      sheet = fs.readFileSync(f.sheet),
+      cache = fs.readFileSync(f.cache)
+    fs.chmodSync(marker, 0o600)
+    fs.writeFileSync(marker, bytes)
+    fs.chmodSync(marker, mode)
+    await assert.rejects(recoverRenders(p, capabilities), (error) => {
+      assert.equal(
+        error.message,
+        `${message} Render recovery evidence is retained at ${stage}.` +
+          ' Preserve that folder and the current sheet/cache before retrying.',
+      )
+      assert.deepEqual([error.recoveryStage, error.renderRestored], [stage, undefined])
+      return true
+    })
+    assert.deepEqual(fs.readFileSync(f.sheet), sheet)
+    assert.deepEqual(sheet, f.next)
+    assert.deepEqual(fs.readFileSync(f.cache), cache)
+    assert.equal(fs.readFileSync(marker, 'utf8'), bytes)
+  }
+})
+
+// The directory sync after a move fails: the move has happened, but the caller sees it fail.
+function syncFailsAfterMove(t, moved) {
+  const exclusive = require('../lib/exclusive_rename'),
+    rename = exclusive.renameExclusive,
+    open = fs.promises.open
+  let armed = false
+  t.mock.method(exclusive, 'renameExclusive', async (from, to) => {
+    const result = await rename(from, to)
+    if (moved(to)) armed = true
+    return result
+  })
+  t.mock.method(fs.promises, 'open', async function (...args) {
+    if (!armed) return open.apply(this, args)
+    armed = false
+    throw Object.assign(new Error('injected directory sync failure'), { code: 'EIO' })
+  })
+}
+
+test('a render whose stage move fails its sync is rolled back and reported as restored', async (t) => {
+  const { publishRender } = require(modulePath),
+    f = fixture(t),
+    p = await input(f)
+  syncFailsAfterMove(
+    t,
+    (to) => /^render-[a-f0-9-]{36}$/.test(path.basename(to)) && path.basename(path.dirname(to)) !== 'render-history',
+  )
+  await assert.rejects(publishRender(p, capabilities), (error) => {
+    const [retained] = renderHistory(f)
+    assert.equal(
+      error.message,
+      `injected directory sync failure Render recovery evidence is retained at ${retained}.` +
+        ' Preserve that folder and the current sheet/cache before retrying.',
+    )
+    assert.deepEqual(
+      [error.code, error.recoveryStage, error.renderRestored, error.renderCommitted],
+      ['EIO', retained, true, undefined],
+    )
+    return true
+  })
+  t.mock.restoreAll()
+  assert.deepEqual(fs.readFileSync(f.sheet), f.old)
+  assert.deepEqual(fs.readFileSync(f.cache), f.oldCache)
+  assert.deepEqual(pending(f), [])
+})
+
+test('a render whose commit marker move fails its sync is reported as committed, for the caller to record', async (t) => {
+  const { publishRender } = require(modulePath),
+    f = fixture(t),
+    p = await input(f)
+  syncFailsAfterMove(t, (to) => path.basename(to) === 'commit.json')
+  await assert.rejects(publishRender(p, capabilities), (error) => {
+    assert.deepEqual(
+      [error.code, error.renderCommitted, error.renderRestored, error.committed],
+      ['EIO', true, undefined, true],
+    )
+    assert.equal(error.sheetRecord.path, f.sheet)
+    assert.equal(error.cacheRevision, sha(fs.readFileSync(f.cache)))
+    assert.ok(error.cache.spreads[p.spreadId])
+    return true
+  })
+  t.mock.restoreAll()
+  assert.deepEqual(fs.readFileSync(f.sheet), f.next)
+  assert.deepEqual(pending(f), [])
+})

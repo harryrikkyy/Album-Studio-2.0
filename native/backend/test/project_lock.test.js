@@ -510,3 +510,90 @@ test('a refused acquisition retires its unused owner and names the lock', async 
   assert.equal(history.filter((name) => name.includes('-unused-')).length, 1)
   await held.release()
 })
+
+// A lock whose holder was killed: the next acquisition has to reclaim it.
+async function deadHolder(f) {
+  const running = child(holder, [f.file]),
+    ready = await running.message()
+  running.proc.kill('SIGKILL')
+  await running.done
+  return ready
+}
+const moveFailure = (from) =>
+  Object.assign(new Error(`injected move failure for ${path.basename(from)}`), { code: 'EIO' })
+
+test('a failed reclamation also reports a guard it could not retire, and keeps both locks', async (t) => {
+  const { acquireProjectLease } = require(modulePath)
+  const exclusive = require('../lib/exclusive_rename'),
+    move = exclusive.renameExclusive,
+    f = fixture(t),
+    { lockPath } = await deadHolder(f),
+    guardPath = `${lockPath}.reclaim`,
+    failing = new Set([lockPath, guardPath])
+  t.mock.method(exclusive, 'renameExclusive', async (from, to) => {
+    if (failing.delete(from)) throw moveFailure(from)
+    return move(from, to)
+  })
+  const error = await acquireProjectLease(f.file).then(
+    () => null,
+    (e) => e,
+  )
+  const lockFailure = `injected move failure for ${path.basename(lockPath)} Both lock locations were preserved for inspection: ${lockPath}; `
+  const guardFailure = `injected move failure for ${path.basename(guardPath)} Both lock locations were preserved for inspection: ${guardPath}; `
+  assert.ok(error.message.startsWith(lockFailure), error.message)
+  assert.ok(error.message.includes(` Guard recovery failed: ${guardFailure}`), error.message)
+  assert.ok(!error.message.includes('The acquired owner remains preserved'), error.message)
+  assert.equal(error.lockPath, lockPath)
+  assert.deepEqual([fs.existsSync(lockPath), fs.existsSync(guardPath)], [true, true])
+})
+
+test('a guard stuck after a reclamation says the new owner stays on the lock', async (t) => {
+  const { acquireProjectLease } = require(modulePath)
+  const exclusive = require('../lib/exclusive_rename'),
+    move = exclusive.renameExclusive,
+    f = fixture(t),
+    { lockPath, token } = await deadHolder(f),
+    guardPath = `${lockPath}.reclaim`
+  t.mock.method(exclusive, 'renameExclusive', async (from, to) => {
+    if (from === guardPath) throw moveFailure(from)
+    return move(from, to)
+  })
+  const error = await acquireProjectLease(f.file).then(
+    () => null,
+    (e) => e,
+  )
+  const guardFailure = `injected move failure for ${path.basename(guardPath)} Both lock locations were preserved for inspection: ${guardPath}; `
+  assert.ok(error.message.startsWith(guardFailure), error.message)
+  assert.ok(
+    error.message.endsWith(` The acquired owner remains preserved at ${lockPath}; no project work was started.`),
+    error.message,
+  )
+  assert.equal(error.lockPath, guardPath)
+  assert.notEqual(JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'))).token, token)
+  assert.equal(fs.existsSync(guardPath), true)
+})
+
+test('a refusal names an unused owner it could not retire', async (t) => {
+  const { acquireProjectLease } = require(modulePath)
+  const exclusive = require('../lib/exclusive_rename'),
+    move = exclusive.renameExclusive,
+    f = fixture(t),
+    held = await acquireProjectLease(f.file)
+  t.mock.method(exclusive, 'renameExclusive', async (from, to) => {
+    if (path.basename(to).includes('-unused-')) throw moveFailure(from)
+    return move(from, to)
+  })
+  const error = await acquireProjectLease(f.file).then(
+    () => null,
+    (e) => e,
+  )
+  exclusive.renameExclusive.mock.restore()
+  const [unused] = fs.readdirSync(f.folder).filter((name) => name.includes('.candidate-')),
+    folder = path.join(fs.realpathSync(f.folder), unused)
+  assert.deepEqual([error.code, error.lockPath], ['PROJECT_BUSY', held.lockPath])
+  assert.ok(
+    error.message.includes(` Unused owner evidence remains at ${folder}: injected move failure for ${unused} `),
+    error.message,
+  )
+  await held.release()
+})

@@ -504,3 +504,89 @@ test('a stage whose journal is not JSON is kept, and recovery names it', async (
   assert.equal(fs.readFileSync(journal, 'utf8'), '{not json')
   assert.deepEqual(fs.readFileSync(f.file), f.old)
 })
+
+test('a damaged commit marker stops recovery and leaves the published file in place', async (t) => {
+  for (const [bytes, what] of [
+    ['{not json', 'publication commit JSON'],
+    ['null', 'exact publication commit revision'],
+  ]) {
+    const f = fixture(t)
+    await killAt(f, await input(f), 'commit')
+    const [stage] = stages(f),
+      marker = path.join(stage, 'commit.json'),
+      { mode } = fs.statSync(marker)
+    fs.chmodSync(marker, 0o600)
+    fs.writeFileSync(marker, bytes)
+    fs.chmodSync(marker, mode)
+    await assert.rejects(recoverFiles(f.folder, caps), (error) => {
+      assert.equal(
+        error.message,
+        `The ${what} changed during file publication. Existing files and recovery evidence were preserved.` +
+          ` File publication evidence is retained at ${stage}.`,
+      )
+      assert.deepEqual(
+        [error.code, error.recoveryStage, error.publicationRestored],
+        ['PUBLICATION_CONFLICT', stage, undefined],
+      )
+      return true
+    })
+    assert.deepEqual(fs.readFileSync(f.file), f.next)
+    assert.equal(fs.readFileSync(marker, 'utf8'), bytes)
+  }
+})
+
+// The directory sync after a move fails: the move has happened, but the caller sees it fail.
+function syncFailsAfterMove(t, moved) {
+  const rename = exclusive.renameExclusive,
+    open = fs.promises.open
+  let armed = false
+  t.mock.method(exclusive, 'renameExclusive', async (from, to) => {
+    const result = await rename(from, to)
+    if (moved(to)) armed = true
+    return result
+  })
+  t.mock.method(fs.promises, 'open', async function (...args) {
+    if (!armed) return open.apply(this, args)
+    armed = false
+    throw Object.assign(new Error('injected directory sync failure'), { code: 'EIO' })
+  })
+}
+
+test('a publication whose stage move fails its sync is rolled back and reported as restored', async (t) => {
+  const f = fixture(t),
+    p = await input(f)
+  syncFailsAfterMove(t, (to) => /^files-/.test(path.basename(to)) && path.basename(path.dirname(to)) !== 'history')
+  await assert.rejects(publishFiles(p, caps), (error) => {
+    const [retained] = history(f)
+    assert.equal(error.message, `injected directory sync failure File publication evidence is retained at ${retained}.`)
+    assert.deepEqual(
+      [error.code, error.recoveryStage, error.publicationCommitted, error.publicationRestored],
+      ['EIO', retained, false, true],
+    )
+    return true
+  })
+  t.mock.restoreAll()
+  assert.deepEqual(fs.readFileSync(f.file), f.old)
+  assert.deepEqual(stages(f), [])
+})
+
+test('a publication whose commit marker move fails its sync is reported as committed', async (t) => {
+  const f = fixture(t),
+    p = await input(f)
+  syncFailsAfterMove(t, (to) => path.basename(to) === 'commit.json')
+  await assert.rejects(publishFiles(p, caps), (error) => {
+    const [retained] = history(f)
+    assert.deepEqual(
+      [error.code, error.recoveryStage, error.publicationCommitted, error.publicationRestored, error.committed],
+      ['EIO', retained, true, undefined, true],
+    )
+    assert.deepEqual(
+      error.records.map((record) => record.name),
+      ['manual.psd'],
+    )
+    return true
+  })
+  t.mock.restoreAll()
+  assert.deepEqual(fs.readFileSync(f.file), f.next)
+  assert.deepEqual(stages(f), [])
+})
