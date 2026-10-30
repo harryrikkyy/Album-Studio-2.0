@@ -179,3 +179,7 @@ This is not hosted CI. These checks used a real Apple GPU, a newer macOS and Nod
 22.23.3. The corpus gate was not rerun locally: its four crates, the lockfile and `xtask` are
 byte-identical to the previous pin, which passed that job on hosted CI. It runs again when this pin
 is pushed. Packaging, native GUI and clean-customer-Mac checks remain separate requirements.
+
+Hosted CI then ran this pin. Run 41062213208 on `3c0ac25` passed the native job, which had failed on
+all three earlier finished runs of the branch, and the integration job. Its corpus job hadn't finished
+when this was written.

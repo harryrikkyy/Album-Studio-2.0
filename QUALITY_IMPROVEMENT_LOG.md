@@ -131,11 +131,13 @@ stays at 7 until more of the 47 fall.
   can count an unreached branch in a large function as covered, so batches 4b-3 on choose pins with
   marked copies and give every extracted predicate a random comparison. A sweep proves old against
   new, so a branch only a sweep reaches still needs a test.
-- CI: the native workspace's Rust tests fail on GitHub ("Workspace tests" in run 40826660009).
-  The engine pin moved to `5301ba3` to fix two engine tests. One stopped the hosted job, matched by
-  log length rather than by reading the hosted log; the other would have failed next. Local gates
-  pass apart from the Poppler test, and the corpus gate wasn't rerun, so the next hosted run has to
-  confirm it: [docs/quality/ENGINE_PIN_AND_CI.md](docs/quality/ENGINE_PIN_AND_CI.md).
+- CI: run 41062213208 on `3c0ac25` passed the native workspace job, which had failed on all three
+  earlier finished runs of this branch, so the engine pin at `5301ba3` holds on GitHub as well as
+  locally. The integration job passed too. The corpus job hadn't finished when this was written: it
+  takes over two hours, and the pin left its inputs unchanged. The five commits after `3c0ac25`
+  change only backend JavaScript, its tests and this log, and have no hosted run yet, because the
+  first push to `Album-Studio-2.0` at `7c5f423` started no CI run:
+  [docs/quality/ENGINE_PIN_AND_CI.md](docs/quality/ENGINE_PIN_AND_CI.md).
 - Phase 5: five accessibility findings in three controls lack keyboard operation: the
   Inspector's photo rows, the spread's frame hit areas and the frame-adjust overlay
   (`eslint-suppressions.json`). Coverage limits rise from 88/88 (shared) and 94/88 (backend).
