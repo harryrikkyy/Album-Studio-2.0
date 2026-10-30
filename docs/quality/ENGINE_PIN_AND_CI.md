@@ -180,6 +180,8 @@ This is not hosted CI. These checks used a real Apple GPU, a newer macOS and Nod
 byte-identical to the previous pin, which passed that job on hosted CI. It runs again when this pin
 is pushed. Packaging, native GUI and clean-customer-Mac checks remain separate requirements.
 
-Hosted CI then ran this pin. Run 41062213208 on `3c0ac25` passed the native job, which had failed on
-all three earlier finished runs of the branch, and the integration job. Its corpus job hadn't finished
-when this was written.
+Hosted CI then ran this pin, and all three jobs passed on both runs. Run 41062213208 on `3c0ac25`
+passed the native job, which had failed on all three earlier finished runs of the branch, and its
+corpus job took 2 h 37 min. Run 41076354641 on `13b90ce`, the first on `Album-Studio-2.0`, took
+2 h 19 min for the same job. That run was started by hand: Actions was off in the new repository
+until then, so the two pushes before it started no CI run.

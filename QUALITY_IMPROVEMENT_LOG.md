@@ -131,12 +131,11 @@ stays at 7 until more of the 47 fall.
   can count an unreached branch in a large function as covered, so batches 4b-3 on choose pins with
   marked copies and give every extracted predicate a random comparison. A sweep proves old against
   new, so a branch only a sweep reaches still needs a test.
-- CI: run 41062213208 on `3c0ac25` passed the native workspace job, which had failed on all three
-  earlier finished runs of this branch, so the engine pin at `5301ba3` holds on GitHub as well as
-  locally. The integration job passed too. The corpus job hadn't finished when this was written: it
-  takes over two hours, and the pin left its inputs unchanged. The five commits after `3c0ac25`
-  change only backend JavaScript, its tests and this log, and have no hosted run yet, because the
-  first push to `Album-Studio-2.0` at `7c5f423` started no CI run:
+- CI: the engine pin at `5301ba3` holds on GitHub as well as locally. Run 41062213208 on `3c0ac25`
+  passed all three jobs, including the native workspace job that had failed on all three earlier
+  finished runs of this branch. Run 41076354641 on `13b90ce`, the first on `Album-Studio-2.0`,
+  passed all three as well, so the six commits after `3c0ac25` are covered. That run was started by
+  hand after Actions was turned on, so no push has started CI there yet:
   [docs/quality/ENGINE_PIN_AND_CI.md](docs/quality/ENGINE_PIN_AND_CI.md).
 - Phase 5: five accessibility findings in three controls lack keyboard operation: the
   Inspector's photo rows, the spread's frame hit areas and the frame-adjust overlay
