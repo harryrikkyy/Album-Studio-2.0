@@ -303,7 +303,10 @@ async function committedStage(t, f) {
 
 test('a damaged commit marker stops recovery and leaves the saved project in place', async (t) => {
   const { recoverProject } = require(modulePath)
-  for (const [bytes, message] of [['{not json', 'The project commit marker is invalid.']]) {
+  for (const [bytes, message] of [
+    ['{not json', 'The project commit marker is invalid.'],
+    ['null', 'The project commit marker does not match its journal.'],
+  ]) {
     const f = fixture(t),
       stage = await committedStage(t, f),
       marker = path.join(stage, 'commit.json'),

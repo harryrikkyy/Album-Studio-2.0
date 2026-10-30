@@ -207,7 +207,7 @@ async function projectCommitted(stage, digest) {
   } catch (_) {
     throw new Error('The project commit marker is invalid.')
   }
-  if (value.version !== 1 || value.journal !== digest)
+  if (!value || value.version !== 1 || value.journal !== digest)
     throw new Error('The project commit marker does not match its journal.')
   return true
 }
