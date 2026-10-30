@@ -25,7 +25,6 @@ const stat = (file) =>
     if (error.code === 'ENOENT') return null
     throw error
   })
-/** @returns {RecoverableError} */
 // What cleanup reports about stage files, before and after the stage moves into history.
 const STAGE_FILES = Object.freeze({
   unknown: null,
@@ -37,6 +36,7 @@ const CAPTURED_FILES = Object.freeze({
   edited: 'A captured private file was edited or replaced.',
   unreadable: 'A captured private file became unreadable or changed.',
 })
+/** @returns {RecoverableError} */
 function preserved(file, detail, code = 'PRIVATE_STAGE_PRESERVED') {
   return Object.assign(
     new Error(`${detail} Private work was preserved at ${file}. Inspect it before retrying; no history was pruned.`),
@@ -192,7 +192,6 @@ async function createPrivateStage(parent, prefix = '.source-', options = {}) {
       const original = await stat(folder),
         captured = await stat(retained)
       if (original || !sameNode(captured, identity)) {
-        /** @type {RecoverableError} */
         const failure = preserved(
           sameNode(captured, identity) ? retained : folder,
           `Atomic private stage retention failed: ${error.message}; inspect both ${folder} and ${retained}.`,
