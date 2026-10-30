@@ -142,6 +142,7 @@ const EXPECTATION_FIELDS = Object.freeze({
 function validExpectationFields(e) {
   const fields = EXPECTATION_FIELDS[e.mode]
   return (
+    typeof e.mode === 'string' &&
     Array.isArray(fields) &&
     exactKeys(e, fields) &&
     !(e.mode === 'source' && !sourceRevision(e)) &&

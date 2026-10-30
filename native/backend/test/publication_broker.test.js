@@ -381,6 +381,19 @@ test('a publication request with fields its mode does not define is refused befo
     assert.throws(() => requestOf(request(f, expected)), { code: 'PUBLICATION_PROTOCOL' })
   assert.deepEqual(fs.readFileSync(f.target), f.old)
 })
+test('a mode that is not a string is refused rather than read as an overwrite', async (t) => {
+  const { requestOf } = require('../lib/publication_broker'),
+    f = fixture(t),
+    record = await fingerprintFile(f.target)
+  for (const expected of [
+    { mode: ['new'] },
+    { mode: ['overwrite'] },
+    { mode: ['source'], digest: record.digest, size: record.size },
+    { mode: ['exact'], record },
+    { mode: [['exact']], record },
+  ])
+    assert.throws(() => requestOf(request(f, expected)), /invalid prior-revision/, JSON.stringify(expected.mode))
+})
 test('a document save whose deciding paths are relative is refused before anything is written', async (t) => {
   const f = fixture(t),
     record = await fingerprintFile(f.target),
