@@ -68,15 +68,23 @@ locking code (`labnaming.js`, `publication_broker.js`, `verified_file.js`, `cach
 each save or publication ran on the old and new code with every file-system call failing in turn,
 failing from that call on, or with another writer's edit arriving just before it, comparing the
 calls, the result or error, what recovery did and the files left: 27,638 runs over 34 scenarios,
-with up to 2,002 calls per operation, plus 20,000 random or changed inputs to the journal and
-request checks, with 0 differences. Deliberate mutants were caught in every task; one that marked
-a publication committed too early survived the planned sweeps until a scenario edited the stage
-journal mid-run, and delivery was cancelled at every position because its checks make no
-file-system calls. 18 new tests pinned the failure paths, each mutation-checked; backend tests
-rose from 898 to 916, and `publication_broker.js` coverage from 92% to 99% of lines. Three of those
-tests close a gap the split exposed: no test had ever reached the `verified_file.js` branch that
-replaces a read error unable to take a close error, though the earlier coverage figure counted it.
-Readability stays at 7 until more of the 47 fall.
+with up to 834 calls per operation, plus 20,000 random or changed inputs to the journal and request
+checks, with 0 differences. The broker is the exception: its saves make about 2,000 calls, mostly
+lock and publication work this phase swept separately or didn't change, so its 2,052 of those runs
+failed every call the broker makes itself, the first 20, the last 120 and every 25th between.
+Deliberate mutants were caught in every task; one that marked a publication committed too early
+survived the planned sweeps until a scenario edited the stage journal mid-run, and delivery was
+cancelled at every position because its checks make no file-system calls. 32 new tests pinned the
+failure paths, each mutation-checked; backend tests rose from 898 to 930, and
+`publication_broker.js` coverage from 92% to 99% of lines. A late coverage check and the final
+review found the report had counted branches no test reached inside large functions, which the
+split exposed in `verified_file.js`, the project lock's failed reclamations and all three commit
+markers. Those are now pinned, as is what a save reports when a directory sync fails just after its
+move, and a random comparison of three predicates the plan had skipped found 0 differences in
+90,000 inputs. The review also led to two real fixes, each with its own test: a publication mode
+sent as an array such as `["new"]` passed validation and then behaved as `overwrite`, and a project
+commit marker holding `null` gave a raw TypeError instead of the mismatch message. Readability
+stays at 7 until more of the 47 fall.
 
 ## Phases
 
@@ -117,13 +125,17 @@ Readability stays at 7 until more of the 47 fall.
   install, commit and recover (`project_transaction.js`, `file_publication.js`,
   `render_transaction.js`, `delivery_transaction.js`); merging them is a design change, not a
   split. When `cache.js` can't examine a moved snapshot, its retention report still names the
-  original path (pinned as today's behaviour). `delivery_transaction.js` coverage moves by up to
-  0.8 points of lines between full runs, because one lock branch runs only when the six processes
-  in its competing-restart test collide; a deterministic test would settle it.
+  original path (pinned as today's behaviour). The `recovery.renderCommitted` and
+  `recovery.publicationCommitted` checks in the failure paths matter only if a commit marker
+  appears between two reads, and no test reaches them. Node's coverage report, and lcov with it,
+  can count an unreached branch in a large function as covered, so batches 4b-3 on choose pins with
+  marked copies and give every extracted predicate a random comparison. A sweep proves old against
+  new, so a branch only a sweep reaches still needs a test.
 - CI: the native workspace's Rust tests fail on GitHub ("Workspace tests" in run 40826660009).
-  The engine pin moved to `5301ba3` to fix two engine test bugs. They were matched to that failure
-  by its log length, not by reading the hosted log, and local gates pass, so the next hosted run
-  has to confirm it: [docs/quality/ENGINE_PIN_AND_CI.md](docs/quality/ENGINE_PIN_AND_CI.md).
+  The engine pin moved to `5301ba3` to fix two engine tests. One stopped the hosted job, matched by
+  log length rather than by reading the hosted log; the other would have failed next. Local gates
+  pass apart from the Poppler test, and the corpus gate wasn't rerun, so the next hosted run has to
+  confirm it: [docs/quality/ENGINE_PIN_AND_CI.md](docs/quality/ENGINE_PIN_AND_CI.md).
 - Phase 5: five accessibility findings in three controls lack keyboard operation: the
   Inspector's photo rows, the spread's frame hit areas and the frame-adjust overlay
   (`eslint-suppressions.json`). Coverage limits rise from 88/88 (shared) and 94/88 (backend).
