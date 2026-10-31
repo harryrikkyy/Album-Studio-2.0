@@ -86,6 +86,33 @@ sent as an array such as `["new"]` passed validation and then behaved as `overwr
 commit marker holding `null` gave a raw TypeError instead of the mismatch message. Readability
 stays at 7 until more of the 47 fall.
 
+Phase 4b-3 split the 16 functions above complexity 20 in the rendering, colour, PDF and proof code
+(`preflight.js`, `render.js`, `deliver.js`, `color.js`, `pdf.js`, `proofs.js`, `parity.js`,
+`psd_template.js`) into named helpers; 31 of the 47 remain for batches 4b-4, 4b-5 and phase 5. These
+functions had less testing than the last batch, so each was pinned first, using exact branch marks
+on a copy of the old code: tests reached 1,255 of their 1,814 branch outcomes before and 1,796 now.
+The 18 left can't be reached, because an earlier check or the way a value is read rules them out.
+Backend tests rose from 930 to 1,985, and backend coverage from 95.5% to 96.6% of lines and from
+89.3% to 92.2% of branches. Of 1,265 deliberate mutants of the 16 functions, 1,243 were caught; the
+other 22 change nothing a test could see, being equivalent code, dead writes or the unreachable
+outcomes above. A 30-second limit first counted timed-out mutants as caught, which hid two real
+survivors in `runExport` until the limit rose to 120 seconds. Those two now have a test, and the
+other 8 timeouts, rerun on the old code, are real hangs.
+
+Each split was then compared with the original, with 0 differences: 756,000 random or changed
+inputs, including 6,000 whole albums through preflight; 44 authored `psdPixels` cases; 75,987 runs
+of the render, export and proof jobs with each collaborator call failing, cancelled or answering
+differently; and 4,382 runs with each file-system call failing once or from then on. Of 192 sampled
+mutants of the new code, 180 were caught by the comparison they were aimed at and 9 by another; the
+last 3 are an unreachable branch and a dead write. The sweeps never reach a developed photo, a font
+edit, a turned photo, a bad selection or a proof refresh, so those paths rest on the collaborator
+comparisons and the pins. No moved per-pixel loop slowed by more than 3.6%. Pinning found two real
+bugs, each fixed after the unchanged split in its own commit, with a test that failed first: photos
+on a page with no template picture and no preview failed with 'Input buffer contains unsupported
+image format', and an unreadable photo in a buffered preview reported 's.split is not a function'
+instead of naming the photo. Testing stays at 8, because its target needs the component,
+accessibility and rule tests of phase 5, and Readability stays at 7 until more of the 31 fall.
+
 ## Phases
 
 | Phase | Status |
@@ -97,7 +124,8 @@ stays at 7 until more of the 47 fall.
 | 4a. Null-checked types | Done 2026-10-29 |
 | 4b-1. Contract runtime and shared modules | Done 2026-10-29 |
 | 4b-2. Verified reads, publication and locking | Done 2026-10-30 |
-| 4b-3 to 4b-5, 4c, 4d, 5–7 | Not started |
+| 4b-3. Rendering, colour, PDF and proofs | Done 2026-10-31 |
+| 4b-4, 4b-5, 4c, 4d, 5–7 | Not started |
 
 ## Open items
 
@@ -115,12 +143,11 @@ stays at 7 until more of the 47 fall.
   `onConflict`'s conflict, the overlay list).
 - Phase 4 (from 4b-1): the proof renderer's pinning tests hash the JPEG bytes sharp writes on
   macOS with Apple silicon (CI's platform), so another runner, or a sharp update such as
-  Dependabot's weekly ones, needs new pins taken before any renderer change. Nothing yet pins
-  which stack slot each photo takes on an edited-template page holding both h and v photos; pin
-  one before batch 4b-3. On an edited-template page, two frames with the same name share one
-  slot, so one of their photos is lost; flattened pages draw both (this predates 4b-1).
-  `contrastStage` applies clarity, and `matchesArray`/`matchesObject` return false or nothing
-  where `matchesCombinator` returns a boolean; clearer names would help.
+  Dependabot's weekly ones, needs new pins taken before any renderer change. On an edited-template
+  page, two frames with the same name share one slot, so one of their photos is lost; flattened
+  pages draw both (this predates 4b-1). `contrastStage` applies clarity, and
+  `matchesArray`/`matchesObject` return false or nothing where `matchesCombinator` returns a
+  boolean; clearer names would help.
 - Phase 4 (from 4b-2): four modules repeat one transaction skeleton of prepare, journal, capture,
   install, commit and recover (`project_transaction.js`, `file_publication.js`,
   `render_transaction.js`, `delivery_transaction.js`); merging them is a design change, not a
@@ -131,11 +158,18 @@ stays at 7 until more of the 47 fall.
   can count an unreached branch in a large function as covered, so batches 4b-3 on choose pins with
   marked copies and give every extracted predicate a random comparison. A sweep proves old against
   new, so a branch only a sweep reaches still needs a test.
+- Phase 4 (from 4b-3): in `templateArt`, 'The template changed while its cached backdrop was
+  checked' is thrown inside a `try` whose `catch` swallows it, so the code falls through to a full
+  decode, which verifies. `applyFrameEdit` writes `f.hidden` and `f.opacity`, which are recomputed
+  for every frame straight after, so nothing reads them. In `frozenPhotos`, `ph.original ||
+  ph.thumb` never reads `ph.thumb`, because a `sourceKey` only comes with an original. Later
+  batches count a timed-out mutant as caught only if it's a real hang.
 - CI: the engine pin at `5301ba3` holds on GitHub as well as locally. Run 41062213208 on `3c0ac25`
   passed all three jobs, including the native workspace job that had failed on all three earlier
   finished runs of this branch. Run 41076354641 on `13b90ce`, the first on `Album-Studio-2.0`,
   passed all three as well, so the six commits after `3c0ac25` are covered. That run was started by
-  hand after Actions was turned on, so no push has started CI there yet:
+  hand after Actions was turned on. Run 41099409111 on `2449d75` was started by the push and passed
+  all three jobs, so pushes now start CI there:
   [docs/quality/ENGINE_PIN_AND_CI.md](docs/quality/ENGINE_PIN_AND_CI.md).
 - Phase 5: five accessibility findings in three controls lack keyboard operation: the
   Inspector's photo rows, the spread's frame hit areas and the frame-adjust overlay
