@@ -28,9 +28,6 @@
   "native/backend/lib/picks.js": {
     "max-len": 1
   },
-  "native/backend/lib/preflight.js": {
-    "complexity": 1
-  },
   "native/backend/lib/print_settings.js": {
     "max-len": 1
   },
