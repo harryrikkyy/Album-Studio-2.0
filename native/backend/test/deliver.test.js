@@ -12,7 +12,7 @@ process.env.ALBUM_STUDIO_CACHE_DIR = tmpdir()
 
 const sharp = require('sharp')
 const agpsd = require('ag-psd')
-const { exportPlan, startExport, exportSheet } = require('../lib/deliver')
+const { exportPlan, startExport, exportSheet, exportStatus, cancelExport } = require('../lib/deliver')
 const { writeJpegPdf, jpegComponents } = require('../lib/pdf')
 const { openAlbum } = require('../lib/album')
 const { spreadHash } = require('../lib/render')
@@ -179,6 +179,13 @@ test('export: JPEG folders and the PDF beside the sheets, unchanged sheets skipp
   r = await run({ album: proj, heightInches: 2, pdf: false })
   assert.equal(r.finished.done, 3)
   assert.equal((await sharp(path.join(proj, 'JPEG-High-Res', 'Page_001.jpg')).metadata()).height, 600)
+})
+
+test('a finished export is no longer running, and nothing is left to stop', async () => {
+  const { proj } = await makeAlbum()
+  await run({ album: proj, heightInches: 1 })
+  assert.deepEqual(exportStatus(), { running: false })
+  assert.deepEqual(cancelExport(), { cancelled: false })
 })
 
 test('export refuses without rendered sheets', async () => {
