@@ -249,6 +249,10 @@ test('a spread with no template fails', async () => {
   await failedWith('the spread has no template', {}, { spreads: [spread(1, { template: null })] })
 })
 
+test('a spread with no template and no photos is told about the template', async () => {
+  await failedWith('the spread has no template', {}, { spreads: [spread(1, { template: null, photoIds: [] })] })
+})
+
 test('a template not on disk fails, by name', async () => {
   await failedWith("the template T isn't on disk", {}, { spreads: [spread(1, { template: { name: 'T' } })] })
 })
@@ -261,6 +265,13 @@ test('a sheet owned elsewhere leaves no way past a file at the output path', asy
   await failedWith(`An unowned sheet exists at ${SHEET}. Preserve it before rendering.`, {
     ownedSheetRecord: () => ({ ...VERIFIED, path: '/old/s1.psd' }),
     fingerprintRenderFile: () => SAME_SHEET,
+  })
+})
+
+test('a file at the output path is refused ahead of an edited sheet elsewhere', async () => {
+  await failedWith(`An unowned sheet exists at ${SHEET}. Preserve it before rendering.`, {
+    ownedSheetRecord: () => ({ ...VERIFIED, path: '/old/s1.psd' }),
+    fingerprintRenderFile: () => ({ digest: 'edited' }),
   })
 })
 
@@ -354,9 +365,13 @@ test('an old cache entry is its hash alone', async () => {
 // ── what stops a spread before it is built ──────────────────────────────────
 
 test('preflight errors fail the spread, joined with a space', async () => {
-  await failedWith('one problem. another problem.', {
+  const h = await failedWith('one problem. another problem.', {
     preflightAlbum: () => ({ errors: [{ message: 'one problem.' }, { message: 'another problem.' }], info: [] }),
   })
+  assert.deepEqual(
+    h.events.map(([, event]) => event.state),
+    ['preparing', 'failed'],
+  )
 })
 
 test('preflight runs for this spread alone, in the render phase, on these inputs', async () => {
@@ -386,9 +401,10 @@ test('a photo with no original fails the spread', async () => {
 })
 
 test('an original that changed before its snapshot fails the spread', async () => {
-  await failedWith('The original changed before its render snapshot was made.', {
+  const h = await failedWith('The original changed before its render snapshot was made.', {
     placeableEvidence: () => ({ file: DEVELOPED, digest: 'developed', sourceKey: 'another' }),
   })
+  assert.deepEqual(h.named('bakeAdjustmentsEvidence'), [])
 })
 
 test('a developed image that changed before its snapshot fails the spread', async () => {
@@ -527,9 +543,28 @@ test('a spread changed during rendering fails at publication', async () => {
   })
 })
 
-test('a private file changed during construction fails at publication', async () => {
+test('a changed project is named ahead of a changed stage', async () => {
+  await failedWith('The project or source files changed during rendering. Retry from the current revision.', {
+    readFile: () => '{"project":2}',
+    assertFiles: () => fail('the stage moved'),
+  })
+})
+
+for (const [name, frozen] of [
+  ['photo', FROZEN_PHOTO],
+  ['template', FROZEN_TEMPLATE],
+]) {
+  test(`a frozen ${name} changed during construction fails at publication`, async () => {
+    await failedWith('A private render source changed during construction. Preserve /stage before retrying.', {
+      fileDigest: (file) => (file === frozen ? 'tampered' : CLEAN.fileDigest(file)),
+    })
+  })
+}
+
+test('a preview changed after it was digested fails at publication', async () => {
+  let reads = 0
   await failedWith('A private render source changed during construction. Preserve /stage before retrying.', {
-    fileDigest: (file) => (file === FROZEN_PHOTO ? 'tampered' : CLEAN.fileDigest(file)),
+    fileDigest: (file) => (file === PREVIEW && ++reads === 2 ? 'tampered' : CLEAN.fileDigest(file)),
   })
 })
 
@@ -750,6 +785,18 @@ test('a failed spread does not stop the next one', async () => {
     h.events.filter(([, event]) => event.state === 'failed'),
     [['render.progress', { jobId: 'job', index: 1, total: 2, n: 1, state: 'failed', error: 'the build broke' }]],
   )
+})
+
+test('a failure is reported before the engine closes', async () => {
+  let shown
+  const h = harness({
+    ...onceBroken(),
+    closeAll: () => {
+      shown = h.events.at(-1)[1].state
+    },
+  })
+  await h.run()
+  assert.equal(shown, 'failed')
 })
 
 test('a dead engine is replaced for the next spread', async () => {

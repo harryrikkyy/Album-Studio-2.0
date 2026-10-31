@@ -251,6 +251,7 @@ test('each exported file joins the stage', async () => {
 test('a file the stage refuses fails the sheet, before anything else is made', async () => {
   const { finished, named } = await running({ register: () => fail('refused') })
   assert.equal(finished.error, 'refused')
+  assert.deepEqual(finished.results, [])
   assert.deepEqual(
     named('register').map((c) => c[1]),
     [`${STAGE}/Page_001-high.jpg`],
@@ -307,6 +308,33 @@ test('a job stopped at its last sheet publishes nothing and cleans up', async ()
   assert.deepEqual(h.named('releaseJob').length, 1)
 })
 
+test('a job stopped at its last sheet is not failed by a source that changed', async () => {
+  const h = harness({
+    exportSheet: () => {
+      h.job.cancelled = true
+      return SIZE
+    },
+    readFile: () => 'another project',
+  })
+  const finished = await h.run()
+  assert.equal(finished.cancelled, true)
+  assert.equal(finished.error, null)
+})
+
+test('a job stopped during the PDF publishes nothing', async () => {
+  const h = harness(
+    {
+      writeJpegPdf: () => {
+        h.job.cancelled = true
+      },
+    },
+    { want: { pdf: true } },
+  )
+  const finished = await h.run()
+  assert.equal(finished.cancelled, true)
+  assert.deepEqual(h.named('publishDelivery'), [])
+})
+
 test('a failed sheet ends the export', async () => {
   const { finished, progress, named } = await running({ exportSheet: () => fail('no pixels') })
   assert.equal(finished.failed, 1)
@@ -347,7 +375,7 @@ test('a wanted PDF gathers every page, in plan order', async () => {
 })
 
 test('a PDF with a page missing fails', async () => {
-  const { finished, named } = await running(
+  const { finished, named, progress } = await running(
     {},
     { plan: { spreads: [sheet(1), sheet(2)] }, spreads: [sheet(1)], want: { pdf: true } },
   )
@@ -355,6 +383,10 @@ test('a PDF with a page missing fails', async () => {
   assert.equal(finished.error, error)
   assert.deepEqual(finished.pdf, { error })
   assert.deepEqual(named('writeJpegPdf'), [])
+  assert.deepEqual(
+    progress().filter((event) => event.state === 'pdf'),
+    [],
+  )
 })
 
 test('with no PDF wanted a failure leaves pdf null', async () => {

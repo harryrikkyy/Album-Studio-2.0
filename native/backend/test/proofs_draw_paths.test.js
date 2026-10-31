@@ -421,6 +421,10 @@ test('a developed RAW that changed before its snapshot stops the draw', async ()
     previewable: rawPhoto(bytes, { sourceKey: 'another revision' }),
   })
   await assert.rejects(s.draw(), { message: /^The photo changed before its proof snapshot was made\./ })
+  assert.deepEqual(
+    s.seen.frozen.map(([name]) => name),
+    ['page.psd'],
+  )
 })
 
 test('a developed RAW is keyed on its original, not on its thumbnail', async () => {
@@ -767,14 +771,14 @@ test('a drawn proof lands at its name and leaves its stage empty', async () => {
   assert.equal(fs.existsSync(seen.stage[2]), false)
 })
 
+// The finished proof was registered, so the stage it's left in knows every file it holds.
+const CLEAN_FAILURE = /^Atomic file capture failed: (?!.*needs review)/
+
 test("a file already at the proof's name stays, and the stage retires", async () => {
   const s = await scene()
   fs.mkdirSync(path.dirname(s.out), { recursive: true })
   fs.writeFileSync(s.out, 'kept')
-  await assert.rejects(
-    s.draw(),
-    (error) => error.code === 'EEXIST' && /^Atomic file capture failed: /.test(error.message),
-  )
+  await assert.rejects(s.draw(), (error) => error.code === 'EEXIST' && CLEAN_FAILURE.test(error.message))
   assert.equal(fs.readFileSync(s.out, 'utf8'), 'kept')
   assert.equal(fs.existsSync(s.seen.stage[2]), false)
 })
@@ -792,7 +796,7 @@ test('a folder that can’t be made stops the proof', async () => {
 test('a layered proof meeting a file at its name leaves it too', async () => {
   const s = await scene({ ws: EDITS })
   fs.writeFileSync(s.out, 'kept')
-  await assert.rejects(s.draw(), (error) => error.code === 'EEXIST')
+  await assert.rejects(s.draw(), (error) => error.code === 'EEXIST' && CLEAN_FAILURE.test(error.message))
   assert.equal(fs.readFileSync(s.out, 'utf8'), 'kept')
 })
 
