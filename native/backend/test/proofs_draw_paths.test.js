@@ -328,9 +328,19 @@ test('an invalid colour is white', async () => {
   looksLike(page.at(OUTSIDE), WHITE)
 })
 
-test('photos on a blank page fail today: the blank base has no format to read back', async () => {
-  const s = await scene({ preview: null })
-  await assert.rejects(s.draw(), { message: /^Input buffer contains unsupported image format/ })
+test('a photo on a blank page is drawn over the page colour', async () => {
+  const { page, result } = await drawn({ preview: null, ws: { pageBackgrounds: { 4: '#102030' } } })
+  assert.deepEqual(result, { skipped: [] })
+  looksLike(page.at(OUTSIDE), [16, 32, 48])
+  looksLike(page.at(INSIDE), RED)
+})
+
+test('a buffered preview draws a photo on a blank page too', async () => {
+  const row = { preview: null, ws: { pageBackgrounds: { 4: '#102030' } } }
+  const { page, result } = await drawn(row, { buffered: true })
+  assert.deepEqual(result.skipped, [])
+  looksLike(page.at(OUTSIDE), [16, 32, 48])
+  looksLike(page.at(INSIDE), RED)
 })
 
 test('with no layers the page is the base alone', async () => {

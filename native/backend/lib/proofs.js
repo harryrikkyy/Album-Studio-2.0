@@ -381,7 +381,7 @@ function proofBase(sharp, pr, backdrop, W, H, background) {
       channels: 3,
       background: pr.parseHexColor(background) || { r: 255, g: 255, b: 255 },
     },
-  })
+  }).png() // Raw pixels carry no format, and writeProof reads this back to lay the photos on.
 }
 
 /** Each frame's layers in drawing order, and what could not be drawn. */
