@@ -746,6 +746,10 @@ test('a failed spread does not stop the next one', async () => {
     ['failed', 'done'],
   )
   assert.deepEqual([h.job.failed, h.job.done], [1, 1])
+  assert.deepEqual(
+    h.events.filter(([, event]) => event.state === 'failed'),
+    [['render.progress', { jobId: 'job', index: 1, total: 2, n: 1, state: 'failed', error: 'the build broke' }]],
+  )
 })
 
 test('a dead engine is replaced for the next spread', async () => {
@@ -814,6 +818,7 @@ test('a stage is retired after a failure', async () => {
 test('with no stage made there is nothing to retire', async () => {
   const h = await finished({ preflightAlbum: () => fail('not ready') })
   assert.deepEqual(h.named('cleanup'), [])
+  assert.deepEqual(h.job.finishingErrors, [])
 })
 
 // ── the job's edges ─────────────────────────────────────────────────────────
@@ -890,6 +895,7 @@ test('with everything skipped no session was started, so none closes', async () 
   const h = await finished(OWNED)
   assert.deepEqual(h.named('session'), [])
   assert.deepEqual(h.named('session.close'), [])
+  assert.deepEqual(h.job.finishingErrors, [])
 })
 
 test('each spread starts from the cache the last one published', async () => {

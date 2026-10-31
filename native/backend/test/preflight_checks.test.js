@@ -234,7 +234,13 @@ for (const [name, outline] of [
   ['a layer past it', { width: 100, height: 100, children: [{ left: 0, top: 0, right: 20000, bottom: 10000 }] }],
   [
     'a nested layer past it',
-    { width: 100, height: 100, children: [{ children: [{ left: 0, top: 0, right: 20000, bottom: 10000 }] }] },
+    {
+      width: 100,
+      height: 100,
+      children: [
+        { left: 0, top: 0, right: 1, bottom: 1, children: [{ left: 0, top: 0, right: 20000, bottom: 10000 }] },
+      ],
+    },
   ],
   ['a layer of no known size', { width: 100, height: 100, children: [{}] }],
   ['one byte past it', { ...AT_BUDGET, children: [{ left: 0, top: 0, right: 1, bottom: 1 }] }],

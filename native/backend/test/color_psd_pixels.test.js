@@ -165,10 +165,15 @@ test('first failure wins: a CMYK document with no profile and a bad composite', 
 })
 
 test('a profile is checked before the route is chosen', async () => {
-  const broken = Buffer.from(f.adobeCompatibleProfile())
-  broken.write('nope', broken.readUInt32BE(132 + 6 * 12 + 4))
-  await assert.rejects(route(psd({ mode: 1, channels: 1, resources: [resource(1039, broken)] })), {
-    message: /unknown tone curve type/,
+  // Only the check reads a CMYK profile's tables, so nothing after it can refuse these.
+  const broken = Buffer.from(await f.icc('cmyk'))
+  for (let i = 0; i < broken.readUInt32BE(128); i++) {
+    const at = 132 + i * 12
+    if (broken.toString('ascii', at, at + 4).startsWith('A2B')) broken.write('BAD!', broken.readUInt32BE(at + 4))
+  }
+  await assert.rejects(route(psd({ resources: [resource(1039, broken)] })), {
+    message:
+      /^The sheet colour profile is invalid or unsupported \(source transform could not be verified by LittleCMS\)/,
   })
   assert.deepEqual(engine.log, [])
 })
