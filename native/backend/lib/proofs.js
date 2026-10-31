@@ -299,6 +299,137 @@ async function spreadLayout({ album: albumPath, n }) {
   }
 }
 
+/** The template's art with its backdrop and masks frozen, unless the template moved on first. */
+async function frozenArt(spread, inputValues, sourceStage, buffered) {
+  const originalArt = await templateArt(
+    spread.template.file,
+    MAX_EDGE,
+    buffered ? { sourceDigest: inputValues[1] } : undefined,
+  )
+  if (originalArt.sourceKey !== contentKey(spread.template.file, inputValues[1]))
+    throw new Error('The template changed before its proof snapshot was made.')
+  const art = { ...originalArt, frames: originalArt.frames.map((f) => ({ ...f })) }
+  if (art.backdrop) art.backdrop = await sourceStage.snapshot(art.backdrop, originalArt.artifactDigests[art.backdrop])
+  for (const f of art.frames)
+    if (f.mask) f.mask = await sourceStage.snapshot(f.mask, originalArt.artifactDigests[f.mask])
+  return art
+}
+
+/** The spread's photos, each frozen, as the renderer takes them. */
+async function frozenPhotos(spread, album, ws, inputValues, sourceStage, buffered) {
+  const dirs = {
+    developedDir: path.join(ws.outputToken || path.join(album.path, 'exports'), '.album-studio', 'raw'),
+    previewDir: path.join(cacheRoot(), 'raw-previews'),
+  }
+
+  const photos = []
+  for (const id of spread.photoIds) {
+    const ph = album.photos[id]
+    if (!ph) continue // gone from disk: its frame keeps the template's placeholder, as in the sheet
+    const src = await photoSource(ph, dirs)
+    const expected = inputValues[2].find((v) => v[0] === id)[2]
+    if (src.sourceKey && src.sourceKey !== contentKey(ph.original || ph.thumb, expected))
+      throw new Error('The photo changed before its proof snapshot was made.')
+    const frozen = await sourceStage.snapshot(src.file, src.digest || expected)
+    photos.push({
+      filePath: frozen,
+      fallbackPath: null,
+      orient: ph.orient === 'v' ? 'v' : 'h',
+      rotation: (src.rotation + (Number((ws.imageRotations || {})[id]) || 0)) % 360,
+      placement: (ws.imagePlacements || {})[id] || null,
+      adjust: (ws.imageAdjustments || {})[id] || null,
+      fastEncode: buffered,
+    })
+  }
+  return photos
+}
+
+/** A page with layer edits, drawn by the shared renderer and published to `out`. */
+async function drawLayeredProof(pr, page, sourceStage, out) {
+  const { template, backdrop, art, photos, overlays, background, layerEdits } = page
+  const tree = await require('../../../src/psd_layers').readPsdLayerTree(template)
+  const generated = path.join(sourceStage.path, 'proof.jpg')
+  const r = await pr.renderPageProof({
+    templatePath: template,
+    templatePreviewPath: backdrop,
+    frames: art.frames,
+    canvasWidth: art.width,
+    canvasHeight: art.height,
+    photos,
+    outputPath: generated,
+    maxEdge: MAX_EDGE,
+    smartCrop: false,
+    overlays,
+    pageBackground: background,
+    layerEdits,
+    psdLayers: tree && tree.ok ? tree.layers : null,
+  })
+  if (!r.ok) throw new Error(r.error)
+  await sourceStage.register(generated)
+  await renameExclusive(generated, out)
+  sourceStage.forget(generated)
+  return { skipped: (r.skipped || []).map((s) => s.error) }
+}
+
+/** What the photos go on: the template's picture, else a plain page. */
+function proofBase(sharp, pr, backdrop, W, H, background) {
+  if (backdrop) return sharp(backdrop, { failOn: 'none' }).resize(W, H, { fit: 'fill' })
+  return sharp({
+    create: {
+      width: W,
+      height: H,
+      channels: 3,
+      background: pr.parseHexColor(background) || { r: 255, g: 255, b: 255 },
+    },
+  })
+}
+
+/** Each frame's layers in drawing order, and what could not be drawn. */
+async function drawFrames(sharp, pr, pairs, dims) {
+  const skipped = []
+  const renderFrame = async ({ frame, photo }) => {
+    if (frame.hidden) return [] // clipped to a hidden layer: hidden in the sheet too
+    try {
+      const layer = await pr.buildPhotoLayer(sharp, photo, frame, dims.scale, false)
+      if (frame.mask) {
+        // The frame's shape, opacity and inside stroke, all in one alpha mask.
+        layer.input = await sharp(layer.input)
+          .ensureAlpha()
+          .composite([{ input: frame.mask, blend: 'dest-in' }])
+          .png()
+          .toBuffer()
+      } else if (frame.opacity < 1) {
+        layer.input = await sharp(layer.input).ensureAlpha(frame.opacity).png().toBuffer()
+      }
+      const stroke = frame.stroke && !frame.stroke.revealed ? strokeLayer(frame, dims.scale) : null
+      return [
+        await clipToCanvas(sharp, layer, dims.width, dims.height),
+        stroke && (await clipToCanvas(sharp, stroke, dims.width, dims.height)),
+      ]
+    } catch (e) {
+      skipped.push(e.message)
+      return []
+    }
+  }
+  const drawn = []
+  // A bounded number of decoders avoids multiplying full-resolution pixel allocations.
+  for (let i = 0; i < pairs.length; i += 3) drawn.push(...(await Promise.all(pairs.slice(i, i + 3).map(renderFrame))))
+  return { layers: drawn.flat().filter(Boolean), skipped }
+}
+
+/** Finishes the page: returned as a JPEG when buffered, otherwise published to `out`. */
+async function writeProof(base, layers, sharp, out, sourceStage, buffered, skipped) {
+  if (!buffered) await fs.promises.mkdir(path.dirname(out), { recursive: true })
+  const page = layers.length ? sharp(await base.toBuffer()).composite(layers) : base
+  if (buffered) return { skipped, jpeg: await page.jpeg({ quality: 85 }).toBuffer() }
+  const tmp = path.join(sourceStage.path, 'proof.jpg')
+  await page.jpeg({ quality: 85, mozjpeg: true }).toFile(tmp)
+  await sourceStage.register(tmp)
+  await renameExclusive(tmp, out)
+  sourceStage.forget(tmp)
+  return { skipped }
+}
+
 /**
  * Draw spread `spread` to `out`.
  * @param {{ buffered?: boolean, inputs?: Awaited<ReturnType<typeof spreadInputs>> }} [options]
@@ -316,128 +447,27 @@ async function drawProof(spread, album, ws, out, options = {}) {
     const sharp = getSharp()
     const pr = proofRenderer()
     const n = spread.n
-    const originalArt = await templateArt(
-      spread.template.file,
-      MAX_EDGE,
-      buffered ? { sourceDigest: inputValues[1] } : undefined,
-    )
-    if (originalArt.sourceKey !== contentKey(spread.template.file, inputValues[1]))
-      throw new Error('The template changed before its proof snapshot was made.')
-    const art = { ...originalArt, frames: originalArt.frames.map((f) => ({ ...f })) }
-    if (art.backdrop) art.backdrop = await sourceStage.snapshot(art.backdrop, originalArt.artifactDigests[art.backdrop])
-    for (const f of art.frames)
-      if (f.mask) f.mask = await sourceStage.snapshot(f.mask, originalArt.artifactDigests[f.mask])
+    const art = await frozenArt(spread, inputValues, sourceStage, buffered)
     const dims = pr.proofDims(art.width, art.height, MAX_EDGE)
-    const dirs = {
-      developedDir: path.join(ws.outputToken || path.join(album.path, 'exports'), '.album-studio', 'raw'),
-      previewDir: path.join(cacheRoot(), 'raw-previews'),
-    }
-
-    const photos = []
-    for (const id of spread.photoIds) {
-      const ph = album.photos[id]
-      if (!ph) continue // gone from disk: its frame keeps the template's placeholder, as in the sheet
-      const src = await photoSource(ph, dirs)
-      const expected = inputValues[2].find((v) => v[0] === id)[2]
-      if (src.sourceKey && src.sourceKey !== contentKey(ph.original || ph.thumb, expected))
-        throw new Error('The photo changed before its proof snapshot was made.')
-      const frozen = await sourceStage.snapshot(src.file, src.digest || expected)
-      photos.push({
-        filePath: frozen,
-        fallbackPath: null,
-        orient: ph.orient === 'v' ? 'v' : 'h',
-        rotation: (src.rotation + (Number((ws.imageRotations || {})[id]) || 0)) % 360,
-        placement: (ws.imagePlacements || {})[id] || null,
-        adjust: (ws.imageAdjustments || {})[id] || null,
-        fastEncode: buffered,
-      })
-    }
+    const photos = await frozenPhotos(spread, album, ws, inputValues, sourceStage, buffered)
     const overlays = (ws.pageOverlays || {})[n] || []
     const background = (ws.pageBackgrounds || {})[n] || null
+    const backdrop = art.backdrop || spread.template.preview
 
     // Template layers switched off or retyped: the shared proof renderer (src/proof_renderer.js)
     // rebuilds the page from the PSD's layer stack, so hand those spreads to it unchanged.
     if (layerEdits && Object.keys(layerEdits).length) {
-      const tree = await require('../../../src/psd_layers').readPsdLayerTree(template)
-      const r = await pr.renderPageProof({
-        templatePath: template,
-        templatePreviewPath: art.backdrop || spread.template.preview,
-        frames: art.frames,
-        canvasWidth: art.width,
-        canvasHeight: art.height,
-        photos,
-        outputPath: path.join(sourceStage.path, 'proof.jpg'),
-        maxEdge: MAX_EDGE,
-        smartCrop: false,
-        overlays,
-        pageBackground: background,
-        layerEdits,
-        psdLayers: tree && tree.ok ? tree.layers : null,
-      })
-      if (!r.ok) throw new Error(r.error)
-      const generated = path.join(sourceStage.path, 'proof.jpg')
-      await sourceStage.register(generated)
-      await renameExclusive(generated, out)
-      sourceStage.forget(generated)
-      return { skipped: (r.skipped || []).map((s) => s.error) }
+      const page = { template, backdrop, art, photos, overlays, background, layerEdits }
+      return drawLayeredProof(pr, page, sourceStage, out)
     }
 
-    const W = dims.width
-    const H = dims.height
-    const backdrop = art.backdrop || spread.template.preview
-    let base = backdrop
-      ? sharp(backdrop, { failOn: 'none' }).resize(W, H, { fit: 'fill' })
-      : sharp({
-          create: {
-            width: W,
-            height: H,
-            channels: 3,
-            background: pr.parseHexColor(background) || { r: 255, g: 255, b: 255 },
-          },
-        })
+    const base = proofBase(sharp, pr, backdrop, dims.width, dims.height, background)
+    const { layers, skipped } = await drawFrames(sharp, pr, pairFrames(art.frames, photos), dims)
 
-    const pairs = pairFrames(art.frames, photos)
-    const skipped = []
-    const renderFrame = async ({ frame, photo }) => {
-      if (frame.hidden) return [] // clipped to a hidden layer: hidden in the sheet too
-      try {
-        const layer = await pr.buildPhotoLayer(sharp, photo, frame, dims.scale, false)
-        if (frame.mask) {
-          // The frame's shape, opacity and inside stroke, all in one alpha mask.
-          layer.input = await sharp(layer.input)
-            .ensureAlpha()
-            .composite([{ input: frame.mask, blend: 'dest-in' }])
-            .png()
-            .toBuffer()
-        } else if (frame.opacity < 1) {
-          layer.input = await sharp(layer.input).ensureAlpha(frame.opacity).png().toBuffer()
-        }
-        const stroke = frame.stroke && !frame.stroke.revealed ? strokeLayer(frame, dims.scale) : null
-        return [await clipToCanvas(sharp, layer, W, H), stroke && (await clipToCanvas(sharp, stroke, W, H))]
-      } catch (e) {
-        skipped.push(e.message)
-        return []
-      }
-    }
-    const drawn = []
-    // A bounded number of decoders avoids multiplying full-resolution pixel allocations.
-    for (let i = 0; i < pairs.length; i += 3) drawn.push(...(await Promise.all(pairs.slice(i, i + 3).map(renderFrame))))
-    const layers = drawn.flat().filter(Boolean)
-
-    const svg = require('../../../src/overlay_render').buildOverlaySvg(overlays, W, H)
+    const svg = require('../../../src/overlay_render').buildOverlaySvg(overlays, dims.width, dims.height)
     if (svg) layers.push({ input: Buffer.from(svg), top: 0, left: 0 })
 
-    const tmp = buffered ? out : path.join(sourceStage.path, 'proof.jpg')
-    if (!buffered) await fs.promises.mkdir(path.dirname(out), { recursive: true })
-    if (layers.length) base = sharp(await base.toBuffer()).composite(layers)
-    if (buffered) return { skipped, jpeg: await base.jpeg({ quality: 85 }).toBuffer() }
-    else {
-      await base.jpeg({ quality: 85, mozjpeg: true }).toFile(tmp)
-      await sourceStage.register(tmp)
-      await renameExclusive(tmp, out)
-      sourceStage.forget(tmp)
-    }
-    return { skipped }
+    return writeProof(base, layers, sharp, out, sourceStage, buffered, skipped)
   }
   if (!buffered) return withPrivateStage(cacheRoot(), 'proof-sources-', draw)
   let total = 0
@@ -645,6 +675,80 @@ async function refreshOnce(albumPath, r) {
   if (!r.again) r.emit('proofs.idle', { album: album.path, rendered, failed })
 }
 
+function knownPictures(known) {
+  const byHash = new Map(),
+    byId = new Map()
+  for (const [n, e] of Object.entries(known)) {
+    if (!e || !e.hash) continue
+    if (e.id) byId.set(e.id, Number(n))
+    if (e.source !== 'sheet' && !byHash.has(e.hash)) byHash.set(e.hash, Number(n))
+  }
+  return { byHash, byId }
+}
+
+/** What spread `s` needs, given its manifest entry `e`; null when its picture stands. */
+async function refreshTodo(s, e, hash, album) {
+  if (!s.template) {
+    // An empty spread has no picture: an old one would show photos it no longer has.
+    return e || s.proof === proofPath(album.path, s.n) ? { s, remove: true } : null
+  }
+  if (e && e.hash === hash && (e.id === s.id || (!e.id && e.source !== 'sheet'))) {
+    if (!e.digest || (await optionalDigest(proofPath(album.path, s.n))) !== e.digest) {
+      return {
+        s,
+        hash,
+        ...(e.source === 'sheet' && s.sheet ? { fromSheet: s.sheet, sheetDigest: await optionalDigest(s.sheet) } : {}),
+      }
+    }
+    // A sheet saved from the editor since its proof was made: show what the sheet looks like now.
+    if (e.source === 'sheet' && s.sheet) {
+      const digest = await optionalDigest(s.sheet)
+      if (digest !== e.sheetDigest || e.sheetPath !== s.sheet)
+        return { s, hash, fromSheet: s.sheet, sheetDigest: digest }
+    }
+    return null
+  }
+  // A template that isn't on disk (drive unplugged): keep whatever picture there is.
+  return s.template.file ? { s, hash } : null
+}
+
+/** Finds a todo a picture to carry over, or the sheet to draw it from. */
+async function settleTodo(t, known, byId, byHash, album, ws, reuse) {
+  const identityFrom = byId.get(t.s.id)
+  const source = identityFrom && known[identityFrom]
+  const from = source && source.hash === t.hash ? identityFrom : t.hash && byHash.get(t.hash)
+  if (from && from !== t.s.n) {
+    // A hand-edited sheet is specific to this persistent spread, even when Plan inputs match.
+    if (known[from].source === 'sheet') {
+      const digest = await optionalDigest(t.s.sheet)
+      if (known[from].sheetPath !== t.s.sheet || known[from].sheetDigest !== digest) {
+        if (t.s.sheet) {
+          t.fromSheet = t.s.sheet
+          t.sheetDigest = digest
+        }
+        return
+      }
+    }
+    const buf = await fs.promises.readFile(proofPath(album.path, from)).catch(() => null)
+    if (buf && known[from].digest === crypto.createHash('sha256').update(buf).digest('hex'))
+      reuse.set(t.s.n, {
+        buf,
+        source: known[from].source,
+        sheetDigest: known[from].sheetDigest,
+        sheetPath: known[from].sheetPath,
+      })
+  } else if (t.s.sheet) {
+    const record = await require('./sheets').ownedSheetRecord(ws, album.path, t.s.id)
+    if (
+      require('./sheets').verifiedSheetRecord(record) &&
+      record.hash === (await require('./render_inputs').spreadHash(t.s, album, ws))
+    ) {
+      t.fromSheet = t.s.sheet
+      t.sheetDigest = await optionalDigest(t.s.sheet)
+    }
+  }
+}
+
 async function prepareRefresh(albumPath, projectText, targets) {
   await require('./output_paths').validateProofPaths(path.dirname(albumPath))
   const data = JSON.parse(projectText),
@@ -660,13 +764,7 @@ async function prepareRefresh(albumPath, projectText, targets) {
 
   // Pictures already drawn, by what they show; read before anything is overwritten, so a spread
   // that moved takes its picture along instead of being drawn again.
-  const byHash = new Map(),
-    byId = new Map()
-  for (const [n, e] of Object.entries(known)) {
-    if (!e || !e.hash) continue
-    if (e.id) byId.set(e.id, Number(n))
-    if (e.source !== 'sheet' && !byHash.has(e.hash)) byHash.set(e.hash, Number(n))
-  }
+  const { byHash, byId } = knownPictures(known)
 
   /**
    * @type {Array<{ s: (typeof selected)[number], remove?: boolean, hash?: string, fromSheet?: string,
@@ -674,69 +772,11 @@ async function prepareRefresh(albumPath, projectText, targets) {
    */
   const todo = []
   for (const s of selected) {
-    const e = known[s.n]
-    if (!s.template) {
-      // An empty spread has no picture: an old one would show photos it no longer has.
-      if (e || s.proof === proofPath(album.path, s.n)) todo.push({ s, remove: true })
-    } else if (e && e.hash === hashes.get(s.n) && (e.id === s.id || (!e.id && e.source !== 'sheet'))) {
-      if (!e.digest || (await optionalDigest(proofPath(album.path, s.n))) !== e.digest) {
-        todo.push({
-          s,
-          hash: hashes.get(s.n),
-          ...(e.source === 'sheet' && s.sheet
-            ? { fromSheet: s.sheet, sheetDigest: await optionalDigest(s.sheet) }
-            : {}),
-        })
-        continue
-      }
-      // A sheet saved from the editor since its proof was made: show what the sheet looks like now.
-      if (e.source === 'sheet' && s.sheet) {
-        const digest = await optionalDigest(s.sheet)
-        if (digest !== e.sheetDigest || e.sheetPath !== s.sheet)
-          todo.push({ s, hash: hashes.get(s.n), fromSheet: s.sheet, sheetDigest: digest })
-      }
-      continue
-    } else if (s.template.file) {
-      todo.push({ s, hash: hashes.get(s.n) })
-    }
-    // A template that isn't on disk (drive unplugged): keep whatever picture there is.
+    const t = await refreshTodo(s, known[s.n], hashes.get(s.n), album)
+    if (t) todo.push(t)
   }
   const reuse = new Map()
-  for (const t of todo) {
-    const identityFrom = byId.get(t.s.id)
-    const source = identityFrom && known[identityFrom]
-    const from = source && source.hash === t.hash ? identityFrom : t.hash && byHash.get(t.hash)
-    if (from && from !== t.s.n) {
-      // A hand-edited sheet is specific to this persistent spread, even when Plan inputs match.
-      if (known[from].source === 'sheet') {
-        const digest = await optionalDigest(t.s.sheet)
-        if (known[from].sheetPath !== t.s.sheet || known[from].sheetDigest !== digest) {
-          if (t.s.sheet) {
-            t.fromSheet = t.s.sheet
-            t.sheetDigest = digest
-          }
-          continue
-        }
-      }
-      const buf = await fs.promises.readFile(proofPath(album.path, from)).catch(() => null)
-      if (buf && known[from].digest === crypto.createHash('sha256').update(buf).digest('hex'))
-        reuse.set(t.s.n, {
-          buf,
-          source: known[from].source,
-          sheetDigest: known[from].sheetDigest,
-          sheetPath: known[from].sheetPath,
-        })
-    } else if (t.s.sheet) {
-      const record = await require('./sheets').ownedSheetRecord(ws, album.path, t.s.id)
-      if (
-        require('./sheets').verifiedSheetRecord(record) &&
-        record.hash === (await require('./render_inputs').spreadHash(t.s, album, ws))
-      ) {
-        t.fromSheet = t.s.sheet
-        t.sheetDigest = await optionalDigest(t.s.sheet)
-      }
-    }
-  }
+  for (const t of todo) await settleTodo(t, known, byId, byHash, album, ws, reuse)
   const removed = Object.keys(known)
     .map(Number)
     .filter((n) => n > album.spreads.length)
