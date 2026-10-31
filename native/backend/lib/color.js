@@ -768,6 +768,71 @@ async function untaggedRgbProfile() {
   return defaultRgbProfile
 }
 
+function hasNonBlackPixel(data, depth) {
+  const sample = depth / 8
+  for (let i = 0; i < data.length; i += 4 * sample)
+    for (let c = 0; c < 3; c++) if (depth === 8 ? data[i + c] : data.readUInt16LE(i + c * 2)) return true
+  return false
+}
+
+/** The stored composite when it can be trusted, or null when only the engine can render the document. */
+async function storedComposite(buf, source, profile, inMemory) {
+  if (!(source.mode === 3 && source.realMerged !== false && [8, 16].includes(source.depth))) return null
+  const img = decodeRgbComposite(buf, source)
+  if (source.realMerged !== true && !hasNonBlackPixel(img.data, source.depth)) return null
+  if (profile || source.depth === 16)
+    return profiledRgba(img.data, img.width, img.height, profile || (await untaggedRgbProfile()), source.depth, {
+      inMemory,
+    })
+  return {
+    input: img.data,
+    raw: { width: img.width, height: img.height, channels: 4 },
+    width: img.width,
+    height: img.height,
+  }
+}
+
+/** Renders the frozen bytes in a session of its own. Returns the failure, if there was one. */
+async function renderInEngine(PhotoCraftSession, frozen, out, buf, stage, source) {
+  let pc = null,
+    failure
+  try {
+    // The source can change after readPsdBuffer's verification, including A→B→A
+    // changes hidden from later source hashes. The engine must consume these exact
+    // verified bytes, with the same PSD/PSB encoding, rather than reopening its path.
+    await stage.reserveBytes(buf.length + source.width * source.height * 4)
+    await fs.promises.writeFile(frozen, buf, { flag: 'wx', mode: 0o400 })
+    await stage.register(frozen, { digest: crypto.createHash('sha256').update(buf).digest('hex'), readOnly: true })
+    pc = new PhotoCraftSession({ writeRoot: stage.path })
+    await pc.call('doc.open', { path: PhotoCraftSession.readPath(frozen) })
+    await pc.run('edit.convertToProfile', SRGB_POLICY)
+    await pc.call('doc.save', { path: pc.writePath(out) })
+  } catch (error) {
+    failure = error
+  }
+  try {
+    if (pc) await pc.close()
+  } catch (close) {
+    if (failure) {
+      failure.closeError = close
+      failure.message += ` PhotoCraft close also failed: ${close.message}`
+    } else failure = close
+  }
+  return failure
+}
+
+async function verifiedEngineOutput(stage, out, profile) {
+  await stage.assertFiles()
+  await stage.register(out)
+  const meta = await require('../../../src/sharp_config').getSharp()(out, { failOn: 'warning' }).metadata()
+  if (profile && !meta.icc)
+    throw new Error(
+      'The editor render did not retain a verifiable colour profile. Save an 8-bit RGB sheet with its compatibility composite before delivery.',
+    )
+  if (meta.icc) await assertProfileUsable(meta.icc)
+  return { input: out, width: meta.width, height: meta.height, cleanup: colourCleanup(stage) }
+}
+
 /**
  * Shared verified PSD pixels for production sheets and original template backdrops.
  * @param {string} psdPath
@@ -788,67 +853,17 @@ async function psdPixels(psdPath, { buffer, inMemory = false } = {}) {
   }
   if (source.mode === 3 && profile && profile.toString('ascii', 16, 20) !== 'RGB ')
     throw compositeError('the RGB source profile does not match its channels')
-  if (source.mode === 3 && source.realMerged !== false && [8, 16].includes(source.depth)) {
-    const img = decodeRgbComposite(buf, source),
-      sample = source.depth / 8
-    let nonBlack = false
-    for (let i = 0; i < img.data.length && !nonBlack; i += 4 * sample) {
-      for (let c = 0; c < 3 && !nonBlack; c++)
-        nonBlack = source.depth === 8 ? !!img.data[i + c] : !!img.data.readUInt16LE(i + c * 2)
-    }
-    if (source.realMerged === true || nonBlack) {
-      if (profile || source.depth === 16)
-        return profiledRgba(img.data, img.width, img.height, profile || (await untaggedRgbProfile()), source.depth, {
-          inMemory,
-        })
-      return {
-        input: img.data,
-        raw: { width: img.width, height: img.height, channels: 4 },
-        width: img.width,
-        height: img.height,
-      }
-    }
-  }
+  const stored = await storedComposite(buf, source, profile, inMemory)
+  if (stored) return stored
   const { PhotoCraftSession } = require('./photocraft')
   const stage = await createPrivateStage(cacheRoot(), 'as-export-'),
     dir = stage.path,
     out = path.join(dir, 'sheet.png')
   const frozen = path.join(dir, `source.${buf.readUInt16BE(4) === 2 ? 'psb' : 'psd'}`)
-  let pc = null,
-    failure
-  try {
-    // The source can change after readPsdBuffer's verification, including A→B→A
-    // changes hidden from later source hashes. The engine must consume these exact
-    // verified bytes, with the same PSD/PSB encoding, rather than reopening its path.
-    await stage.reserveBytes(buf.length + source.width * source.height * 4)
-    await fs.promises.writeFile(frozen, buf, { flag: 'wx', mode: 0o400 })
-    await stage.register(frozen, { digest: crypto.createHash('sha256').update(buf).digest('hex'), readOnly: true })
-    pc = new PhotoCraftSession({ writeRoot: dir })
-    await pc.call('doc.open', { path: PhotoCraftSession.readPath(frozen) })
-    await pc.run('edit.convertToProfile', SRGB_POLICY)
-    await pc.call('doc.save', { path: pc.writePath(out) })
-  } catch (error) {
-    failure = error
-  }
-  try {
-    if (pc) await pc.close()
-  } catch (close) {
-    if (failure) {
-      failure.closeError = close
-      failure.message += ` PhotoCraft close also failed: ${close.message}`
-    } else failure = close
-  }
+  const failure = await renderInEngine(PhotoCraftSession, frozen, out, buf, stage, source)
   if (failure) return finishPrivateStage(stage, failure)
   try {
-    await stage.assertFiles()
-    await stage.register(out)
-    const meta = await require('../../../src/sharp_config').getSharp()(out, { failOn: 'warning' }).metadata()
-    if (profile && !meta.icc)
-      throw new Error(
-        'The editor render did not retain a verifiable colour profile. Save an 8-bit RGB sheet with its compatibility composite before delivery.',
-      )
-    if (meta.icc) await assertProfileUsable(meta.icc)
-    return { input: out, width: meta.width, height: meta.height, cleanup: colourCleanup(stage) }
+    return await verifiedEngineOutput(stage, out, profile)
   } catch (error) {
     return finishPrivateStage(stage, error)
   }
