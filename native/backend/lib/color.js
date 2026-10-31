@@ -314,16 +314,17 @@ function validateCurve(data) {
   } else throw profileError('unknown tone curve type')
 }
 
-function validateProfile(profile) {
-  if (
+function invalidProfileHeader(profile) {
+  return (
     !Buffer.isBuffer(profile) ||
     profile.length < 132 ||
     profile.length > MAX_PROFILE ||
     profile.readUInt32BE(0) !== profile.length ||
     profile.toString('ascii', 36, 40) !== 'acsp'
-  ) {
-    throw new Error('The sheet has an invalid colour profile. Assign a valid profile in the editor before exporting.')
-  }
+  )
+}
+
+function checkProfileHeader(profile) {
   const version = profile[8],
     profileClass = profile.toString('ascii', 12, 16),
     space = profile.toString('ascii', 16, 20),
@@ -338,29 +339,42 @@ function validateProfile(profile) {
     profile.readUInt32BE(64) > 3
   )
     throw profileError('invalid colour space, PCS or intent')
+}
+
+function invalidTagEntry(profile, signature, offset, size, count, seen) {
+  return (
+    seen.has(signature) ||
+    offset % 4 ||
+    offset < 132 + count * 12 ||
+    size < 8 ||
+    size > profile.length ||
+    offset > profile.length - size
+  )
+}
+
+function checkProfileTag(profile, i, count, seen) {
+  const signature = profile.toString('ascii', 132 + i * 12, 136 + i * 12)
+  const offset = profile.readUInt32BE(136 + i * 12)
+  const size = profile.readUInt32BE(140 + i * 12)
+  if (invalidTagEntry(profile, signature, offset, size, count, seen))
+    throw new Error('The sheet colour profile contains an invalid or truncated tag.')
+  seen.add(signature)
+  const data = profile.subarray(offset, offset + size)
+  if (['rTRC', 'gTRC', 'bTRC', 'kTRC'].includes(signature)) validateCurve(data)
+  if (['rXYZ', 'gXYZ', 'bXYZ', 'wtpt'].includes(signature) && (size < 20 || data.toString('ascii', 0, 4) !== 'XYZ '))
+    throw profileError('invalid matrix or white point tag')
+}
+
+function validateProfile(profile) {
+  if (invalidProfileHeader(profile)) {
+    throw new Error('The sheet has an invalid colour profile. Assign a valid profile in the editor before exporting.')
+  }
+  checkProfileHeader(profile)
   const count = profile.readUInt32BE(128)
   if (!count || count > 4096 || 132 + count * 12 > profile.length)
     throw new Error('The sheet colour profile has an invalid tag table.')
   const seen = new Set()
-  for (let i = 0; i < count; i++) {
-    const signature = profile.toString('ascii', 132 + i * 12, 136 + i * 12)
-    const offset = profile.readUInt32BE(136 + i * 12)
-    const size = profile.readUInt32BE(140 + i * 12)
-    if (
-      seen.has(signature) ||
-      offset % 4 ||
-      offset < 132 + count * 12 ||
-      size < 8 ||
-      size > profile.length ||
-      offset > profile.length - size
-    )
-      throw new Error('The sheet colour profile contains an invalid or truncated tag.')
-    seen.add(signature)
-    const data = profile.subarray(offset, offset + size)
-    if (['rTRC', 'gTRC', 'bTRC', 'kTRC'].includes(signature)) validateCurve(data)
-    if (['rXYZ', 'gXYZ', 'bXYZ', 'wtpt'].includes(signature) && (size < 20 || data.toString('ascii', 0, 4) !== 'XYZ '))
-      throw profileError('invalid matrix or white point tag')
-  }
+  for (let i = 0; i < count; i++) checkProfileTag(profile, i, count, seen)
   return profile
 }
 

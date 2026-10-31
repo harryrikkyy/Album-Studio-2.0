@@ -48,107 +48,131 @@ async function readJpeg(file) {
   }
 }
 
+function nextJpegMarker(buf, state) {
+  if (buf[state.at++] !== 0xff) throw new Error('Invalid JPEG marker.')
+  while (buf[state.at] === 0xff) state.at++
+  return buf[state.at++]
+}
+
+function jpegSegmentLength(buf, at) {
+  if (at + 2 > buf.length) throw new Error('Truncated JPEG marker length.')
+  const length = buf.readUInt16BE(at)
+  if (length < 2 || at + length > buf.length) throw new Error('Truncated JPEG segment.')
+  return length
+}
+
+function isDctFrameMarker(marker) {
+  return marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)
+}
+
+function checkDctFrame(marker, payload, state) {
+  // Eight-bit single-frame DCT, including sequential/progressive arithmetic
+  // coding. Lossless and hierarchical frames cannot be embedded as DCTDecode.
+  if (
+    ![0xc0, 0xc1, 0xc2, 0xc9, 0xca].includes(marker) ||
+    state.frame ||
+    payload.length < 6 ||
+    payload[0] !== 8 ||
+    ![1, 3, 4].includes(payload[5]) ||
+    payload.length !== 6 + payload[5] * 3
+  )
+    throw new Error('Unsupported or malformed JPEG DCT frame.')
+  state.frame = payload[5]
+  state.frameIds = new Set(Array.from({ length: state.frame }, (_, i) => payload[6 + i * 3]))
+  if (state.frameIds.size !== state.frame) throw new Error('Duplicate JPEG frame components.')
+}
+
+function checkScanHeader(payload, state) {
+  const { frame, frameIds } = state
+  const count = payload[0]
+  if (!frame || !frameIds || !count || count > frame || payload.length !== 4 + count * 2)
+    throw new Error('Malformed JPEG SOS scan header.')
+  const ids = new Set()
+  for (let i = 0; i < count; i++) {
+    const id = payload[1 + i * 2]
+    if (!frameIds.has(id) || ids.has(id)) throw new Error('Invalid JPEG scan component.')
+    ids.add(id)
+  }
+  state.scans++
+}
+
+function collectIccChunk(payload, state) {
+  if (payload.length < 14) throw new Error('Truncated JPEG ICC header.')
+  const sequence = payload[12],
+    total = payload[13]
+  if (!sequence || !total || sequence > total || (state.chunkCount && state.chunkCount !== total))
+    throw new Error('Invalid JPEG ICC chunk sequence.')
+  if (!state.chunks) {
+    state.chunks = new Map()
+    state.chunkCount = total
+  }
+  if (state.chunks.has(sequence)) throw new Error('Duplicate JPEG ICC chunk.')
+  state.chunks.set(sequence, payload.subarray(14))
+}
+
+/** Skip entropy bytes, escaped FFs and restart markers; next marker may start another scan. */
+function skipEntropy(buf, start) {
+  let at = start,
+    entropy = false
+  while (at < buf.length) {
+    if (buf[at] !== 0xff) {
+      entropy = true
+      at++
+      continue
+    }
+    const next = buf[at + 1]
+    if (next === 0) {
+      entropy = true
+      at += 2
+      continue
+    }
+    if (next >= 0xd0 && next <= 0xd7) {
+      at += 2
+      continue
+    }
+    break
+  }
+  if (!entropy) throw new Error('The JPEG scan has no entropy data.')
+  return at
+}
+
+/** One marker and its segment, leaving `state.at` on the next marker. */
+function readJpegSegment(buf, state) {
+  const marker = nextJpegMarker(buf, state)
+  if (marker === 0xd9) {
+    state.ended = true
+    return
+  }
+  if (marker === 0xd8 || marker === 0 || marker === undefined) throw new Error('Invalid JPEG marker.')
+  if (marker === 1 || (marker >= 0xd0 && marker <= 0xd7)) return
+  const length = jpegSegmentLength(buf, state.at)
+  const payload = buf.subarray(state.at + 2, state.at + length)
+  if (isDctFrameMarker(marker)) checkDctFrame(marker, payload, state)
+  if (marker === 0xda) checkScanHeader(payload, state)
+  if (marker === 0xe2 && payload.subarray(0, 12).equals(Buffer.from('ICC_PROFILE\0'))) collectIccChunk(payload, state)
+  state.at += length
+  if (marker === 0xda) state.at = skipEntropy(buf, state.at)
+}
+
+function jpegProfile({ chunks, chunkCount, frame }) {
+  if (!chunks) return null
+  if (chunks.size !== chunkCount) throw new Error('Missing JPEG ICC chunk.')
+  const profile = validateProfile(Buffer.concat(Array.from({ length: chunkCount }, (_, i) => chunks.get(i + 1))))
+  const expected = { 1: 'GRAY', 3: 'RGB ', 4: 'CMYK' }[frame]
+  if (profile.toString('ascii', 16, 20) !== expected) throw new Error('JPEG ICC profile channel mismatch.')
+  return profile
+}
+
 /** Validate JPEG markers before handing binary bytes to PDF's decoder; gather ICC APP2 chunks. */
 function jpegInfo(buf) {
   if (buf.length < 4 || buf.readUInt16BE(0) !== 0xffd8) throw new Error('Invalid JPEG signature.')
-  let at = 2,
-    frame = null,
-    frameIds = null,
-    scans = 0,
-    ended = false,
-    chunks = null,
-    chunkCount = 0
-  while (at < buf.length) {
-    if (buf[at++] !== 0xff) throw new Error('Invalid JPEG marker.')
-    while (buf[at] === 0xff) at++
-    const marker = buf[at++]
-    if (marker === 0xd9) {
-      ended = true
-      break
-    }
-    if (marker === 0xd8 || marker === 0 || marker === undefined) throw new Error('Invalid JPEG marker.')
-    if (marker === 1 || (marker >= 0xd0 && marker <= 0xd7)) continue
-    if (at + 2 > buf.length) throw new Error('Truncated JPEG marker length.')
-    const length = buf.readUInt16BE(at)
-    if (length < 2 || at + length > buf.length) throw new Error('Truncated JPEG segment.')
-    const payload = buf.subarray(at + 2, at + length)
-    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
-      // Eight-bit single-frame DCT, including sequential/progressive arithmetic
-      // coding. Lossless and hierarchical frames cannot be embedded as DCTDecode.
-      if (
-        ![0xc0, 0xc1, 0xc2, 0xc9, 0xca].includes(marker) ||
-        frame ||
-        payload.length < 6 ||
-        payload[0] !== 8 ||
-        ![1, 3, 4].includes(payload[5]) ||
-        payload.length !== 6 + payload[5] * 3
-      )
-        throw new Error('Unsupported or malformed JPEG DCT frame.')
-      frame = payload[5]
-      frameIds = new Set(Array.from({ length: frame }, (_, i) => payload[6 + i * 3]))
-      if (frameIds.size !== frame) throw new Error('Duplicate JPEG frame components.')
-    }
-    if (marker === 0xda) {
-      const count = payload[0]
-      if (!frame || !frameIds || !count || count > frame || payload.length !== 4 + count * 2)
-        throw new Error('Malformed JPEG SOS scan header.')
-      const ids = new Set()
-      for (let i = 0; i < count; i++) {
-        const id = payload[1 + i * 2]
-        if (!frameIds.has(id) || ids.has(id)) throw new Error('Invalid JPEG scan component.')
-        ids.add(id)
-      }
-      scans++
-    }
-    if (marker === 0xe2 && payload.subarray(0, 12).equals(Buffer.from('ICC_PROFILE\0'))) {
-      if (payload.length < 14) throw new Error('Truncated JPEG ICC header.')
-      const sequence = payload[12],
-        total = payload[13]
-      if (!sequence || !total || sequence > total || (chunkCount && chunkCount !== total))
-        throw new Error('Invalid JPEG ICC chunk sequence.')
-      if (!chunks) {
-        chunks = new Map()
-        chunkCount = total
-      }
-      if (chunks.has(sequence)) throw new Error('Duplicate JPEG ICC chunk.')
-      chunks.set(sequence, payload.subarray(14))
-    }
-    at += length
-    if (marker === 0xda) {
-      // Skip entropy bytes, escaped FFs and restart markers; next marker may start another scan.
-      let entropy = false
-      while (at < buf.length) {
-        if (buf[at] !== 0xff) {
-          entropy = true
-          at++
-          continue
-        }
-        const next = buf[at + 1]
-        if (next === 0) {
-          entropy = true
-          at += 2
-          continue
-        }
-        if (next >= 0xd0 && next <= 0xd7) {
-          at += 2
-          continue
-        }
-        break
-      }
-      if (!entropy) throw new Error('The JPEG scan has no entropy data.')
-    }
-  }
-  if (!ended || !frame || !scans) throw new Error('Truncated JPEG data, missing frame or missing SOS scan.')
+  const state = { at: 2, frame: null, frameIds: null, scans: 0, ended: false, chunks: null, chunkCount: 0 }
+  while (state.at < buf.length && !state.ended) readJpegSegment(buf, state)
+  if (!state.ended || !state.frame || !state.scans)
+    throw new Error('Truncated JPEG data, missing frame or missing SOS scan.')
   const size = jpegSizeFromBuffer(buf, { stored: true })
   if (!size || !size.width || !size.height) throw new Error('Invalid JPEG dimensions.')
-  let profile = null
-  if (chunks) {
-    if (chunks.size !== chunkCount) throw new Error('Missing JPEG ICC chunk.')
-    profile = validateProfile(Buffer.concat(Array.from({ length: chunkCount }, (_, i) => chunks.get(i + 1))))
-    const expected = { 1: 'GRAY', 3: 'RGB ', 4: 'CMYK' }[frame]
-    if (profile.toString('ascii', 16, 20) !== expected) throw new Error('JPEG ICC profile channel mismatch.')
-  }
-  return { ...size, components: frame, profile }
+  return { ...size, components: state.frame, profile: jpegProfile(state) }
 }
 
 /** Number of colour channels in a JPEG's frame header (1 grey, 3 RGB/YCbCr, 4 CMYK). */

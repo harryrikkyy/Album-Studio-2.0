@@ -7,7 +7,7 @@
     "complexity": 1
   },
   "native/backend/lib/color.js": {
-    "complexity": 5,
+    "complexity": 4,
     "max-len": 1
   },
   "native/backend/lib/deliver.js": {
@@ -27,7 +27,6 @@
     "complexity": 2
   },
   "native/backend/lib/pdf.js": {
-    "complexity": 1,
     "max-len": 1
   },
   "native/backend/lib/picks.js": {
