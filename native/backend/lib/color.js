@@ -77,17 +77,15 @@ async function readPsdBuffer(file) {
   }
 }
 
-/** Read allocation bounds and merged transparency independently of ag-psd's RGBA preview.
- * Adobe's signed layer count identifies transparency; a saved selection is an auxiliary
- * channel even though ag-psd exposes it in the fourth RGBA component. High-depth files may
- * carry the same declaration in global Layr/Lr16/Lr32 blocks rather than the primary info.
- */
-function compositeMetadata(buf) {
-  const need = (at, size, end = buf.length) => {
+/** The bounds check every parser shares, reporting through that parser's own error. */
+function boundsCheck(buf, error) {
+  return (at, size, end = buf.length) => {
     if (!Number.isSafeInteger(at) || !Number.isSafeInteger(size) || at < 0 || size < 0 || at > end - size)
-      throw compositeError('truncated document data')
+      throw error('truncated document data')
   }
-  need(0, 30)
+}
+
+function psdHeader(buf) {
   if (buf.toString('ascii', 0, 4) !== '8BPS') throw compositeError('not a PSD/PSB document')
   const version = buf.readUInt16BE(4),
     channels = buf.readUInt16BE(12),
@@ -104,10 +102,13 @@ function compositeMetadata(buf) {
   const decodedBytes = width * height * Math.max(4, channels) * Math.max(1, depth / 8)
   if (!Number.isSafeInteger(decodedBytes) || decodedBytes > MAX_COMPOSITE_BYTES)
     throw compositeError('compatibility composite exceeds the 512 MiB decoding limit')
-  let at = 30 + buf.readUInt32BE(26)
-  need(at, 4)
-  const resourceLength = buf.readUInt32BE(at)
-  at += 4
+  return { version, channels, height, width, depth, mode }
+}
+
+function scanResources(buf, start, need) {
+  need(start, 4)
+  const resourceLength = buf.readUInt32BE(start)
+  let at = start + 4
   need(at, resourceLength)
   const resourceEnd = at + resourceLength
   let realMerged = null
@@ -129,68 +130,163 @@ function compositeMetadata(buf) {
     at = dataAt + size + (size % 2)
     if (at > resourceEnd) throw compositeError('truncated image resource padding')
   }
-  const lengthBytes = version === 2 ? 8 : 4
-  const lengthAt = (where, bytes, end = buf.length) => {
+  return { resourceEnd, realMerged }
+}
+
+function layerLengthReader(buf, need) {
+  return (where, bytes, end = buf.length) => {
     need(where, bytes, end)
     const value = bytes === 8 ? buf.readBigUInt64BE(where) : BigInt(buf.readUInt32BE(where))
     if (value > BigInt(end)) throw compositeError('invalid layer section length')
     return Number(value)
   }
-  const layerLength = lengthAt(at, lengthBytes),
-    layerAt = at + lengthBytes,
+}
+
+function mergeDeclaration(buf, where, size, alpha) {
+  if (size < 2) throw compositeError('truncated layer count')
+  const value = buf.readInt16BE(where) < 0
+  if (alpha !== null && value !== alpha) throw compositeError('conflicting merged transparency declarations')
+  return value
+}
+
+function scanGlobalBlocks(buf, start, layerEnd, { version, depth }, declared, lengthAt, need) {
+  let at = start,
+    alpha = declared
+  while (at < layerEnd) {
+    // Global blocks are padded to two or four bytes by different writers.
+    let padding = 0
+    while (padding < 3 && at + padding < layerEnd && buf[at + padding] === 0) padding++
+    if (at + padding === layerEnd) break
+    at += padding
+    need(at, 12, layerEnd)
+    const signature = buf.toString('ascii', at, at + 4),
+      key = buf.toString('ascii', at + 4, at + 8)
+    if (!['8BIM', '8B64'].includes(signature)) throw compositeError('invalid global layer block')
+    const bytes = signature === '8B64' || (version === 2 && LONG_LAYER_KEYS.has(key)) ? 8 : 4
+    const size = lengthAt(at + 8, bytes, layerEnd),
+      dataAt = at + 8 + bytes
+    need(dataAt, size, layerEnd)
+    if (key === 'Layr' || key === (depth === 16 ? 'Lr16' : depth === 32 ? 'Lr32' : 'Layr'))
+      alpha = mergeDeclaration(buf, dataAt, size, alpha)
+    at = dataAt + size
+  }
+  return alpha
+}
+
+function scanLayerSection(buf, layerAt, layerEnd, head, lengthAt, need) {
+  const lengthBytes = head.version === 2 ? 8 : 4
+  const infoLength = lengthAt(layerAt, lengthBytes, layerEnd),
+    infoAt = layerAt + lengthBytes
+  need(infoAt, infoLength, layerEnd)
+  const alpha = infoLength ? mergeDeclaration(buf, infoAt, infoLength, null) : null
+  let at = infoAt + infoLength
+  const maskLength = lengthAt(at, 4, layerEnd)
+  at += 4
+  need(at, maskLength, layerEnd)
+  return scanGlobalBlocks(buf, at + maskLength, layerEnd, head, alpha, lengthAt, need)
+}
+
+function checkRgbChannels(buf, { width, height, channels, depth }, alpha, layerEnd, need) {
+  if (channels < 3 || channels > 4) throw compositeError('unsupported RGB extra channels')
+  if (alpha === true && channels !== 4) throw compositeError('merged transparency channel is missing')
+  if (channels === 4 && alpha === null) throw compositeError('fourth-channel transparency provenance is unknown')
+  if (buf.readUInt16BE(layerEnd) === 0 && depth >= 8) need(layerEnd + 2, width * height * channels * (depth / 8))
+}
+
+/** Read allocation bounds and merged transparency independently of ag-psd's RGBA preview.
+ * Adobe's signed layer count identifies transparency; a saved selection is an auxiliary
+ * channel even though ag-psd exposes it in the fourth RGBA component. High-depth files may
+ * carry the same declaration in global Layr/Lr16/Lr32 blocks rather than the primary info.
+ */
+function compositeMetadata(buf) {
+  const need = boundsCheck(buf, compositeError)
+  need(0, 30)
+  const head = psdHeader(buf)
+  const { version, channels, height, width, depth, mode } = head
+  const { resourceEnd, realMerged } = scanResources(buf, 30 + buf.readUInt32BE(26), need)
+  const lengthBytes = version === 2 ? 8 : 4
+  const lengthAt = layerLengthReader(buf, need)
+  const layerLength = lengthAt(resourceEnd, lengthBytes),
+    layerAt = resourceEnd + lengthBytes,
     layerEnd = layerAt + layerLength
   need(layerAt, layerLength)
-  let alpha = null
-  const declare = (where, size) => {
-    if (size < 2) throw compositeError('truncated layer count')
-    const value = buf.readInt16BE(where) < 0
-    if (alpha !== null && value !== alpha) throw compositeError('conflicting merged transparency declarations')
-    alpha = value
+  const scanned = layerLength && [3, 4].includes(mode)
+  const alpha = scanned ? scanLayerSection(buf, layerAt, layerEnd, head, lengthAt, need) : null
+  need(layerEnd, 2)
+  if (mode === 3) checkRgbChannels(buf, head, alpha, layerEnd, need)
+  return { width, height, channels, depth, mode, alpha, realMerged, compositeAt: layerEnd }
+}
+
+function rleRowLength(buf, tableAt, row, countBytes) {
+  return countBytes === 4 ? buf.readUInt32BE(tableAt + row * countBytes) : buf.readUInt16BE(tableAt + row * countBytes)
+}
+
+/** One PackBits row into `planar` at `destination`. Returns where the row's bytes ended. */
+function decodeRleRow(buf, start, end, planar, destination, rowBytes, error) {
+  let at = start,
+    decoded = 0
+  while (at < end) {
+    const control = buf[at++]
+    if (control === 128) continue
+    const count = control < 128 ? control + 1 : 257 - control
+    if (decoded + count > rowBytes) throw error('an RLE row exceeds its width')
+    if (control < 128) {
+      if (at + count > end) throw error('truncated RLE literal')
+      buf.copy(planar, destination + decoded, at, at + count)
+      at += count
+    } else {
+      if (at >= end) throw error('truncated RLE repeat')
+      planar.fill(buf[at++], destination + decoded, destination + decoded + count)
+    }
+    decoded += count
   }
-  if (layerLength && [3, 4].includes(mode)) {
-    const infoLength = lengthAt(layerAt, lengthBytes, layerEnd),
-      infoAt = layerAt + lengthBytes
-    need(infoAt, infoLength, layerEnd)
-    if (infoLength) declare(infoAt, infoLength)
-    at = infoAt + infoLength
-    const maskLength = lengthAt(at, 4, layerEnd)
-    at += 4
-    need(at, maskLength, layerEnd)
-    at += maskLength
-    while (at < layerEnd) {
-      // Global blocks are padded to two or four bytes by different writers.
-      let padding = 0
-      while (padding < 3 && at + padding < layerEnd && buf[at + padding] === 0) padding++
-      if (at + padding === layerEnd) break
-      at += padding
-      need(at, 12, layerEnd)
-      const signature = buf.toString('ascii', at, at + 4),
-        key = buf.toString('ascii', at + 4, at + 8)
-      if (!['8BIM', '8B64'].includes(signature)) throw compositeError('invalid global layer block')
-      const bytes = signature === '8B64' || (version === 2 && LONG_LAYER_KEYS.has(key)) ? 8 : 4
-      const size = lengthAt(at + 8, bytes, layerEnd),
-        dataAt = at + 8 + bytes
-      need(dataAt, size, layerEnd)
-      if (key === 'Layr' || key === (depth === 16 ? 'Lr16' : depth === 32 ? 'Lr32' : 'Layr')) declare(dataAt, size)
-      at = dataAt + size
+  if (decoded !== rowBytes) throw error('truncated RLE row')
+  return at
+}
+
+function decodeRlePlanes(buf, tableAt, { rows, rowBytes, expected }, need, error) {
+  const countBytes = buf.readUInt16BE(4) === 2 ? 4 : 2,
+    tableSize = rows * countBytes
+  need(tableAt, tableSize)
+  let at = tableAt + tableSize,
+    encodedTotal = 0
+  for (let row = 0; row < rows; row++) encodedTotal += rleRowLength(buf, tableAt, row, countBytes)
+  need(at, encodedTotal)
+  const planar = Buffer.allocUnsafe(expected)
+  for (let row = 0; row < rows; row++) {
+    const end = at + rleRowLength(buf, tableAt, row, countBytes)
+    at = decodeRleRow(buf, at, end, planar, row * rowBytes, rowBytes, error)
+  }
+  return planar
+}
+
+function inflatePlanes(buf, at, expected, error) {
+  let planar
+  try {
+    planar = zlib.inflateSync(buf.subarray(at), { maxOutputLength: expected })
+  } catch (_) {
+    throw error('invalid or oversized ZIP composite')
+  }
+  if (planar.length !== expected) throw error('ZIP composite length does not match its planes')
+  return planar
+}
+
+/** ZIP-with-prediction: each row stores the difference from the sample to its left. */
+function undoDelta(planar, { width, depth, rows, rowBytes }) {
+  const sample = depth / 8
+  for (let row = 0; row < rows; row++) {
+    const start = row * rowBytes
+    for (let x = 1; x < width; x++) {
+      const pos = start + x * sample
+      if (depth === 8) planar[pos] = (planar[pos] + planar[pos - 1]) & 255
+      else planar.writeUInt16BE((planar.readUInt16BE(pos) + planar.readUInt16BE(pos - 2)) & 65535, pos)
     }
   }
-  need(layerEnd, 2)
-  if (mode === 3) {
-    if (channels < 3 || channels > 4) throw compositeError('unsupported RGB extra channels')
-    if (alpha === true && channels !== 4) throw compositeError('merged transparency channel is missing')
-    if (channels === 4 && alpha === null) throw compositeError('fourth-channel transparency provenance is unknown')
-    if (buf.readUInt16BE(layerEnd) === 0 && depth >= 8) need(layerEnd + 2, width * height * channels * (depth / 8))
-  }
-  return { width, height, channels, depth, mode, alpha, realMerged, compositeAt: layerEnd }
 }
 
 /** Strict PackBits/ZIP planes shared by RGB and CMYK; no preview or colour conversion. */
 function compositePlanes(buf, { width, height, channels, depth }, compressionAt, error = compositeError) {
-  const need = (at, size) => {
-    if (!Number.isSafeInteger(at) || !Number.isSafeInteger(size) || at < 0 || size < 0 || at > buf.length - size)
-      throw error('truncated document data')
-  }
+  const need = boundsCheck(buf, error)
   const sample = depth / 8,
     rowBytes = width * sample,
     rows = channels * height,
@@ -198,65 +294,16 @@ function compositePlanes(buf, { width, height, channels, depth }, compressionAt,
   if (![8, 16].includes(depth) || !Number.isSafeInteger(expected) || expected > MAX_COMPOSITE_BYTES)
     throw error('unsupported or oversized compatibility composite')
   need(compressionAt, 2)
-  const compression = buf.readUInt16BE(compressionAt)
-  let at = compressionAt + 2,
-    planar
+  const compression = buf.readUInt16BE(compressionAt),
+    at = compressionAt + 2
   if (compression === 0) {
     need(at, expected)
     return buf.subarray(at, at + expected)
   }
-  if (compression === 1) {
-    const countBytes = buf.readUInt16BE(4) === 2 ? 4 : 2,
-      tableSize = rows * countBytes
-    need(at, tableSize)
-    const tableAt = at
-    at += tableSize
-    let encodedTotal = 0
-    for (let row = 0; row < rows; row++)
-      encodedTotal +=
-        countBytes === 4 ? buf.readUInt32BE(tableAt + row * countBytes) : buf.readUInt16BE(tableAt + row * countBytes)
-    need(at, encodedTotal)
-    planar = Buffer.allocUnsafe(expected)
-    for (let row = 0; row < rows; row++) {
-      const length =
-        countBytes === 4 ? buf.readUInt32BE(tableAt + row * countBytes) : buf.readUInt16BE(tableAt + row * countBytes)
-      const end = at + length,
-        destination = row * rowBytes
-      let decoded = 0
-      while (at < end) {
-        const control = buf[at++]
-        if (control === 128) continue
-        const count = control < 128 ? control + 1 : 257 - control
-        if (decoded + count > rowBytes) throw error('an RLE row exceeds its width')
-        if (control < 128) {
-          if (at + count > end) throw error('truncated RLE literal')
-          buf.copy(planar, destination + decoded, at, at + count)
-          at += count
-        } else {
-          if (at >= end) throw error('truncated RLE repeat')
-          planar.fill(buf[at++], destination + decoded, destination + decoded + count)
-        }
-        decoded += count
-      }
-      if (decoded !== rowBytes) throw error('truncated RLE row')
-    }
-  } else if (compression === 2 || compression === 3) {
-    try {
-      planar = zlib.inflateSync(buf.subarray(at), { maxOutputLength: expected })
-    } catch (_) {
-      throw error('invalid or oversized ZIP composite')
-    }
-    if (planar.length !== expected) throw error('ZIP composite length does not match its planes')
-    if (compression === 3)
-      for (let row = 0; row < rows; row++) {
-        const start = row * rowBytes
-        for (let x = 1; x < width; x++) {
-          const pos = start + x * sample
-          if (depth === 8) planar[pos] = (planar[pos] + planar[pos - 1]) & 255
-          else planar.writeUInt16BE((planar.readUInt16BE(pos) + planar.readUInt16BE(pos - 2)) & 65535, pos)
-        }
-      }
-  } else throw error('unsupported composite compression')
+  if (compression === 1) return decodeRlePlanes(buf, at, { rows, rowBytes, expected }, need, error)
+  if (compression !== 2 && compression !== 3) throw error('unsupported composite compression')
+  const planar = inflatePlanes(buf, at, expected, error)
+  if (compression === 3) undoDelta(planar, { width, depth, rows, rowBytes })
   return planar
 }
 
@@ -573,12 +620,7 @@ function cmykError(detail) {
   )
 }
 
-/** Native CMYK compatibility samples, without ag-psd's naive CMYK→RGB preview conversion. */
-function decodeCmykComposite(buf) {
-  const need = (at, size) => {
-    if (!Number.isSafeInteger(at) || !Number.isSafeInteger(size) || at < 0 || size < 0 || at > buf.length - size)
-      throw cmykError('truncated document data')
-  }
+function cmykHeader(buf, need) {
   need(0, 30)
   if (buf.toString('ascii', 0, 4) !== '8BPS' || buf.readUInt16BE(24) !== 4) throw cmykError('not a CMYK PSD/PSB')
   const version = buf.readUInt16BE(4),
@@ -590,55 +632,38 @@ function decodeCmykComposite(buf) {
     throw cmykError('unsupported depth or extra spot channels')
   const dimensionLimit = version === 1 ? 30000 : 300000
   if (width > dimensionLimit || height > dimensionLimit) throw cmykError('dimensions exceed the PSD/PSB format limit')
-  const sample = depth / 8,
-    rowBytes = width * sample,
-    rows = channels * height,
-    expected = rowBytes * rows
+  const expected = width * (depth / 8) * (channels * height)
   if (!Number.isSafeInteger(expected) || expected > MAX_COMPOSITE_BYTES)
     throw cmykError('compatibility composite exceeds the 512 MiB decoding limit')
-  let at = 30 + buf.readUInt32BE(26)
-  need(at, 4)
-  const resourcesLength = buf.readUInt32BE(at),
-    resourceStart = at + 4,
-    resourceEnd = resourceStart + resourcesLength
-  need(resourceStart, resourcesLength)
+  return { version, channels, height, width, depth, expected }
+}
+
+/** This scan's bounds and messages differ from scanResources, so the two stay apart. */
+function scanCmykResources(buf, start, end, need) {
   let realMerged = null
-  for (let r = resourceStart; r < resourceEnd;) {
+  for (let r = start; r < end;) {
     need(r, 7)
     if (buf.toString('ascii', r, r + 4) !== '8BIM') throw cmykError('invalid resource signature')
     const id = buf.readUInt16BE(r + 4),
       nameSize = 1 + buf[r + 6],
       sizeAt = r + 6 + nameSize + (nameSize % 2)
-    if (sizeAt + 4 > resourceEnd) throw cmykError('truncated resource name')
+    if (sizeAt + 4 > end) throw cmykError('truncated resource name')
     const size = buf.readUInt32BE(sizeAt),
       dataAt = sizeAt + 4
-    if (dataAt + size > resourceEnd) throw cmykError('truncated resource')
+    if (dataAt + size > end) throw cmykError('truncated resource')
     if (id === 1057) {
       if (size < 5 || buf.readUInt32BE(dataAt) !== 1 || realMerged !== null)
         throw cmykError('invalid merged-composite declaration')
       realMerged = !!buf[dataAt + 4]
     }
     r = dataAt + size + (size % 2)
-    if (r > resourceEnd) throw cmykError('truncated resource padding')
+    if (r > end) throw cmykError('truncated resource padding')
   }
-  if (realMerged === false) throw cmykError('the document declares no real merged composite')
-  at = resourceEnd
-  const lengthBytes = version === 2 ? 8 : 4
-  const sectionLength = (where) => {
-    need(where, lengthBytes)
-    const value = version === 2 ? buf.readBigUInt64BE(where) : BigInt(buf.readUInt32BE(where))
-    if (value > BigInt(buf.length)) throw cmykError('invalid layer section length')
-    return Number(value)
-  }
-  const layerLength = sectionLength(at),
-    layerAt = at + lengthBytes
-  need(layerAt, layerLength)
-  const hasAlpha = compositeMetadata(buf).alpha === true
-  if (hasAlpha && channels < 5) throw cmykError('transparency plane is missing')
-  const alpha = channels === 5 && hasAlpha
-  if (channels === 5 && !alpha) throw cmykError('an extra channel is not identified as transparency')
-  at = layerAt + layerLength
-  const planar = compositePlanes(buf, { width, height, channels, depth }, at, cmykError)
+  return realMerged
+}
+
+function unmatteCmyk(planar, { width, height, channels, depth, expected }, alpha) {
+  const sample = depth / 8
   const data = Buffer.allocUnsafe(expected),
     pixels = width * height,
     maximum = depth === 8 ? 255 : 65535
@@ -656,7 +681,38 @@ function decodeCmykComposite(buf) {
     }
     if (alpha) write((i * channels + 4) * sample, a)
   }
-  return { data, width, height, channels, depth, alpha }
+  return data
+}
+
+/** Native CMYK compatibility samples, without ag-psd's naive CMYK→RGB preview conversion. */
+function decodeCmykComposite(buf) {
+  const need = boundsCheck(buf, cmykError)
+  const head = cmykHeader(buf, need)
+  const { version, channels, height, width, depth } = head
+  const at = 30 + buf.readUInt32BE(26)
+  need(at, 4)
+  const resourcesLength = buf.readUInt32BE(at),
+    resourceStart = at + 4,
+    resourceEnd = resourceStart + resourcesLength
+  need(resourceStart, resourcesLength)
+  if (scanCmykResources(buf, resourceStart, resourceEnd, need) === false)
+    throw cmykError('the document declares no real merged composite')
+  const lengthBytes = version === 2 ? 8 : 4
+  const sectionLength = (where) => {
+    need(where, lengthBytes)
+    const value = version === 2 ? buf.readBigUInt64BE(where) : BigInt(buf.readUInt32BE(where))
+    if (value > BigInt(buf.length)) throw cmykError('invalid layer section length')
+    return Number(value)
+  }
+  const layerLength = sectionLength(resourceEnd),
+    layerAt = resourceEnd + lengthBytes
+  need(layerAt, layerLength)
+  const hasAlpha = compositeMetadata(buf).alpha === true
+  if (hasAlpha && channels < 5) throw cmykError('transparency plane is missing')
+  const alpha = channels === 5 && hasAlpha
+  if (channels === 5 && !alpha) throw cmykError('an extra channel is not identified as transparency')
+  const planar = compositePlanes(buf, { width, height, channels, depth }, layerAt + layerLength, cmykError)
+  return { data: unmatteCmyk(planar, head, alpha), width, height, channels, depth, alpha }
 }
 
 async function profiledCmyk(composite, profile, options) {
