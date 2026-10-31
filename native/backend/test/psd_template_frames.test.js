@@ -682,6 +682,17 @@ test('a backdrop that can’t be encoded still releases the composite', async ()
   assert.equal(cleaned, 1)
 })
 
+test('a composite that can’t be released fails the template', async () => {
+  const input = Buffer.alloc(W * H * 4, 200)
+  const raw = { width: W, height: H, channels: 4 }
+  const cleanup = async () => {
+    await new Promise(setImmediate)
+    throw new Error('still in use')
+  }
+  const psdPixels = async () => ({ input, raw, width: W, height: H, cleanup })
+  await assert.rejects(loaded({ psdPixels }).templateArt(sheet([PLAIN])), { message: 'still in use' })
+})
+
 test('a composite is released once it has been encoded', async () => {
   let cleaned = 0
   const input = Buffer.alloc(W * H * 4, 200)

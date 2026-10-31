@@ -2,7 +2,8 @@
 
 // What each of the editor's layer overrides and page overlays asks of the engine, in order. The
 // template outline comes from a real PSD; the engine is a fake that records every call and can fail
-// any of them, because a failed step must only ever cost its own warning.
+// any of them, because a failed step must only ever cost its own warning. Each command takes a turn
+// to answer, as the real engine's do, so a step that isn't waited for reports too late.
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -17,14 +18,16 @@ function fakePc({ doc, fail = {}, answers = {} }) {
   const calls = []
   const act = async (op, params) => {
     calls.push([op, params])
+    await new Promise(setImmediate)
     if (fail[op]) throw fail[op] === true ? new Error(`${op} failed`) : fail[op]
     return answers[op] ?? {}
   }
   return {
     calls,
-    call: (op, params) => {
+    call: async (op, params) => {
       if (op !== 'doc.inspect') return act(op, params)
       calls.push([op, params])
+      await new Promise(setImmediate)
       return doc
     },
     run: act,
@@ -272,6 +275,17 @@ for (const [name, edit, op, warning] of [
     const { warnings, calls } = await edited({ 0: edit, 1: { text: 'Hi' } }, { fail: { [op]: true } })
     assert.deepEqual(warnings, [`“Background”: couldn't ${warning} (${op} failed)`])
     assert.deepEqual(calls.at(-1), ['type.edit', { layer: 11, text: 'Hi' }])
+  })
+}
+
+for (const [name, edit, op, warning] of [
+  ['opacity', { 0: { opacity: 0.5 } }, 'layer.setProps', "“Background”: couldn't change its opacity"],
+  ['a retype', { 1: { text: 'Hi' } }, 'type.edit', "“Title”: couldn't retype it"],
+  ['a move', { 0: { dx: 1 } }, 'layer.translate', "“Background”: couldn't move it"],
+]) {
+  test(`a failure at ${name} as the last step is in the warnings handed back`, async () => {
+    const { warnings } = await edited(edit, { fail: { [op]: true } })
+    assert.deepEqual(warnings, [`${warning} (${op} failed)`])
   })
 }
 

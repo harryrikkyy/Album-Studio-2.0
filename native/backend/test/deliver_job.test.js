@@ -1,7 +1,9 @@
 'use strict'
 
 // Every path of an export job. Everything runExport reaches is a stub answering a clean export, and
-// a row overrides what it needs. Exporting a sheet for real is in deliver.test.js.
+// a row overrides what it needs. A stub of something asynchronous takes a turn before it answers, as
+// the real thing does, so a dropped `await` changes what happens next. Exporting a sheet for real is
+// in deliver.test.js.
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -81,14 +83,16 @@ function harness(answers = {}, options = {}) {
     }
   const asyncStub =
     (name) =>
-    async (...args) =>
-      stub(name)(...args)
+    async (...args) => {
+      await new Promise(setImmediate)
+      return stub(name)(...args)
+    }
   const stage = {
     path: STAGE,
-    register: stub('register'),
-    transfer: stub('transfer'),
-    assertFiles: stub('assertFiles'),
-    cleanup: stub('cleanup'),
+    register: asyncStub('register'),
+    transfer: asyncStub('transfer'),
+    assertFiles: asyncStub('assertFiles'),
+    cleanup: asyncStub('cleanup'),
   }
   const { runExport } = loadPrivate('../lib/deliver.js', {
     names: ['runExport'],
@@ -103,7 +107,11 @@ function harness(answers = {}, options = {}) {
           lstat: asyncStub('lstat'),
         },
       },
-      './cache': { fileStamp: () => null, fileDigest: stub('fileDigest'), readVerifiedBuffer: () => null },
+      './cache': {
+        fileStamp: async () => null,
+        fileDigest: asyncStub('fileDigest'),
+        readVerifiedBuffer: async () => null,
+      },
       './private_stage': {
         createPrivateStage: async (...args) => {
           calls.push(['createPrivateStage', ...args])
@@ -115,18 +123,18 @@ function harness(answers = {}, options = {}) {
           return table.exportSheet(...args)
         },
       },
-      './pdf': { writeJpegPdf: stub('writeJpegPdf') },
+      './pdf': { writeJpegPdf: asyncStub('writeJpegPdf') },
       './sheet': { outputName: (n) => `Page_00${n}` },
-      './render_inputs': { spreadHash: stub('spreadHash'), renderInputHash: () => 'input-hash' },
+      './render_inputs': { spreadHash: asyncStub('spreadHash'), renderInputHash: () => 'input-hash' },
       './delivery_transaction': {
-        publishDelivery: stub('publishDelivery'),
-        recoverDeliveries: () => null,
-        verifyOwnedArtifact: stub('verifyOwnedArtifact'),
+        publishDelivery: asyncStub('publishDelivery'),
+        recoverDeliveries: async () => null,
+        verifyOwnedArtifact: asyncStub('verifyOwnedArtifact'),
       },
       './jobs': {
         reserveJob: () => null,
         identifyJob: () => null,
-        releaseJob: stub('releaseJob'),
+        releaseJob: asyncStub('releaseJob'),
         spreadSelection: () => null,
       },
     },
@@ -237,6 +245,15 @@ test('each exported file joins the stage', async () => {
   assert.deepEqual(
     named('register').map((c) => c[1]),
     [`${STAGE}/Page_001-high.jpg`, `${STAGE}/Page_001-low.jpg`],
+  )
+})
+
+test('a file the stage refuses fails the sheet, before anything else is made', async () => {
+  const { finished, named } = await running({ register: () => fail('refused') })
+  assert.equal(finished.error, 'refused')
+  assert.deepEqual(
+    named('register').map((c) => c[1]),
+    [`${STAGE}/Page_001-high.jpg`],
   )
 })
 

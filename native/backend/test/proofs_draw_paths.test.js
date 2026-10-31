@@ -69,8 +69,8 @@ function looksLike(actual, expected, tolerance = 12) {
  * A 100×60 page, spread 4, on a white preview, with one frame and one red photo. A row changes what
  * it tests with `photos` ({ id: colour or file bytes }), `records` (album records laid over the
  * photos'), `missing` (ids the album has lost), `art`, `frames`, `ws`, `preview`, `backdrop`, `mask`,
- * `previewable`, `tree`, `rendered`, `svg`, `build` (replaces `buildPhotoLayer`) and `read`
- * (replaces the buffered read).
+ * `previewable`, `tree`, `rendered`, `svg`, `build` (replaces `buildPhotoLayer`), `read` (replaces
+ * the buffered read) and `mkdir` (runs before the proof's folder is made).
  */
 async function scene(row = {}) {
   const dir = tmpdir()
@@ -132,6 +132,16 @@ async function scene(row = {}) {
   if (ws.pageLayerEdits) fs.mkdirSync(path.dirname(out), { recursive: true })
   const { drawProof } = loadPrivate('../lib/proofs.js', {
     stubs: {
+      fs: {
+        ...fs,
+        promises: {
+          ...fs.promises,
+          mkdir: async (...args) => {
+            if (row.mkdir) await row.mkdir()
+            return fs.promises.mkdir(...args)
+          },
+        },
+      },
       './inputs': {
         ...inputs,
         spreadInputs: async (...args) => {
@@ -732,6 +742,16 @@ test("a file already at the proof's name stays, and the stage retires", async ()
   )
   assert.equal(fs.readFileSync(s.out, 'utf8'), 'kept')
   assert.equal(fs.existsSync(s.seen.stage[2]), false)
+})
+
+test('a folder that can’t be made stops the proof', async () => {
+  const mkdir = async () => {
+    await new Promise(setImmediate)
+    throw new Error('read only')
+  }
+  const s = await scene({ mkdir })
+  await assert.rejects(s.draw(), { message: /^read only / })
+  assert.equal(fs.existsSync(s.out), false)
 })
 
 test('a layered proof meeting a file at its name leaves it too', async () => {

@@ -1,7 +1,9 @@
 'use strict'
 
 // Every path of a render job. Everything runJob reaches is a stub answering a clean render, and a
-// row overrides what it needs. The real engine and real files are in render_finish.test.js.
+// row overrides what it needs. A stub of something asynchronous takes a turn before it answers, as
+// the real thing does, so a dropped `await` changes what happens next. The real engine and real
+// files are in render_finish.test.js.
 
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -107,6 +109,12 @@ function harness(answers = {}, options = {}) {
       calls.push([name, ...args])
       return table[name](...args)
     }
+  const later =
+    (name) =>
+    async (...args) => {
+      await new Promise(setImmediate)
+      return stub(name)(...args)
+    }
   const uuid = { n: 0 }
   class PhotoCraftSession {
     constructor(settings) {
@@ -117,7 +125,7 @@ function harness(answers = {}, options = {}) {
 
     close() {
       calls.push(['session.close'])
-      return table.sessionClose()
+      return new Promise(setImmediate).then(() => table.sessionClose())
     }
   }
   const { runJob } = loadPrivate('../lib/render.js', {
@@ -125,46 +133,46 @@ function harness(answers = {}, options = {}) {
     stubs: {
       child_process: { execFile: (_command, args, done) => table.sips(args, done) },
       crypto: { ...crypto, randomUUID: () => `uuid${++uuid.n}` },
-      fs: { ...fs, promises: { ...fs.promises, mkdir: stub('mkdir'), readFile: stub('readFile') } },
-      './cache': { contentKey, fileDigest: stub('fileDigest') },
+      fs: { ...fs, promises: { ...fs.promises, mkdir: later('mkdir'), readFile: later('readFile') } },
+      './cache': { contentKey, fileDigest: later('fileDigest') },
       './private_stage': {
         createPrivateStage: async (...args) => {
           calls.push(['stage', ...args])
           return {
             path: '/stage',
-            snapshot: stub('snapshot'),
-            register: stub('register'),
+            snapshot: later('snapshot'),
+            register: later('register'),
             forget: stub('forget'),
-            assertFiles: stub('assertFiles'),
-            cleanup: stub('cleanup'),
+            assertFiles: later('assertFiles'),
+            cleanup: later('cleanup'),
           }
         },
       },
-      './inputs': { spreadInputs: stub('spreadInputs') },
-      './render_inputs': { spreadHash: stub('spreadHash'), renderInputHash: stub('renderInputHash') },
+      './inputs': { spreadInputs: later('spreadInputs') },
+      './render_inputs': { spreadHash: later('spreadHash'), renderInputHash: stub('renderInputHash') },
       './render_transaction': {
-        publishRender: stub('publishRender'),
-        fingerprintRenderFile: stub('fingerprintRenderFile'),
+        publishRender: later('publishRender'),
+        fingerprintRenderFile: later('fingerprintRenderFile'),
       },
       './project_transaction': { revisionOf: stub('revisionOf') },
       './photocraft': { PhotoCraftSession },
-      './proofs': { recordSheetProof: stub('recordSheetProof'), proofInputHash: stub('proofInputHash') },
-      './parity': { bakeAdjustmentsEvidence: stub('bakeAdjustmentsEvidence') },
-      './raw': { placeableEvidence: stub('placeableEvidence') },
-      './sheet': { buildSheet: stub('buildSheet'), closeAll: stub('closeAll'), outputName: stub('outputName') },
+      './proofs': { recordSheetProof: later('recordSheetProof'), proofInputHash: stub('proofInputHash') },
+      './parity': { bakeAdjustmentsEvidence: later('bakeAdjustmentsEvidence') },
+      './raw': { placeableEvidence: later('placeableEvidence') },
+      './sheet': { buildSheet: later('buildSheet'), closeAll: later('closeAll'), outputName: stub('outputName') },
       './project': {},
       './sheets': {
         canonicalSheetPath: stub('canonicalSheetPath'),
         outputFolder: () => OUT,
-        ownedSheetRecord: stub('ownedSheetRecord'),
+        ownedSheetRecord: later('ownedSheetRecord'),
         readRenderCache: () => ({}),
-        readRenderCacheSnapshot: stub('readRenderCacheSnapshot'),
+        readRenderCacheSnapshot: later('readRenderCacheSnapshot'),
         verifiedSheetRecord: stub('verifiedSheetRecord'),
       },
       './jobs': {},
       './output_lock': {},
-      './preflight': { preflightAlbum: stub('preflightAlbum') },
-      './print_settings': { printSettings: (p) => p, meetsPrintResolution: stub('meetsPrintResolution') },
+      './preflight': { preflightAlbum: later('preflightAlbum') },
+      './print_settings': { printSettings: (p) => p, meetsPrintResolution: later('meetsPrintResolution') },
       './album': {},
     },
   }).__private
@@ -181,7 +189,9 @@ function harness(answers = {}, options = {}) {
     results: [],
     finishingErrors: [],
   }
-  const lease = { project: { assertOwned: stub('assertOwned'), outputNamespace: { assertFor: stub('assertOutput') } } }
+  const lease = {
+    project: { assertOwned: later('assertOwned'), outputNamespace: { assertFor: later('assertOutput') } },
+  }
   const album = { path: ALBUM, file: PROJECT_FILE, photos: { a: { original: ORIGINAL, base: 'a', orient: 'h' } } }
   const given = {
     ws: {},
