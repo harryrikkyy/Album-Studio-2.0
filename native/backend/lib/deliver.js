@@ -332,201 +332,254 @@ async function assertSnapshot({ album, ws, projectText }, required) {
   }
 }
 
-async function runExport(job, prepared, emit) {
-  const { p, plan, cache, spreads, want, s, paths, missingSheets, lease } = prepared
-  const next = JSON.parse(JSON.stringify(cache))
-  const results = []
-  let pdfResult = null,
-    stage = null,
-    stageCapability = null,
-    transactionOwnsStage = false,
-    error = null
-  const files = [],
-    review = new Map(plan.spreads.filter((sp) => sp.state === 'ready').map((sp) => [sp.id, sp.low]))
+async function openExportStage(run) {
+  const folder = path.join(run.prepared.paths.sheets, '.album-studio')
+  await fs.promises.mkdir(folder, { recursive: true })
+  run.stageCapability = await createPrivateStage(folder, 'delivery-')
+  run.stage = run.stageCapability.path
+}
+
+/** Prepare one sheet's JPEGs in the stage, or skip a sheet that's already exported. */
+async function exportSpread(run, sp, i) {
+  const { job, prepared, emit, next, results, files, review, stage, stageCapability } = run
+  const { p, s } = prepared
+  const { n, id, psd, key, hash } = sp
+  const name = outputName(n)
+  const report = (state, extra = {}) =>
+    emit('export.progress', { jobId: job.id, index: i + 1, total: job.total, n, state, ...extra })
+  const t0 = Date.now()
+  if (!p.force && sp.state === 'ready') {
+    job.skipped++
+    results.push({ n, state: 'skipped' })
+    report('skipped')
+    return
+  }
+  report('exporting')
+  const targets = [
+    { file: path.join(stage, `${name}-high.jpg`), quality: s.highQuality },
+    { file: path.join(stage, `${name}-low.jpg`), quality: s.lowQuality },
+  ]
+  const size = await withPrivateStage(path.dirname(stage), '.delivery-sources-', async (sourceStage) => {
+    const frozen = await sourceStage.snapshot(psd, sp.sheetDigest)
+    return exportSheet(frozen, targets, s, { expectedDigest: sp.sheetDigest, spec: prepared.ws.printSpec, n })
+  })
+  for (const target of targets) await stageCapability.register(target.file)
+  files.push({ source: targets[0].file, target: sp.high }, { source: targets[1].file, target: sp.low })
+  review.set(id, targets[1].file)
+  next.spreads[id] = {
+    n,
+    key,
+    hash,
+    psd,
+    at: new Date().toISOString(),
+    ...size,
+    high: { path: sp.high },
+    low: { path: sp.low },
+  }
+  results.push({ n, state: 'prepared', ms: Date.now() - t0, ...size })
+}
+
+async function exportSpreads(run) {
+  const { job, prepared } = run
+  const { spreads } = prepared
+  for (let i = 0; i < spreads.length; i++) {
+    if (job.cancelled) break
+    await exportSpread(run, spreads[i], i)
+  }
+}
+
+async function writeReviewPdf(run) {
+  const { job, prepared, emit, files, review, stage, stageCapability } = run
+  const { plan, s, paths } = prepared
+  const pages = plan.spreads.map((sp) => ({ path: review.get(sp.id), ppi: s.ppi }))
+  if (pages.some((page) => !page.path))
+    throw new Error('The review JPEGs are incomplete. Export the whole album first.')
+  emit('export.progress', {
+    jobId: job.id,
+    index: job.total,
+    total: job.total,
+    n: null,
+    state: 'pdf',
+    pages: pages.length,
+  })
+  const source = path.join(stage, 'review.pdf')
+  await writeJpegPdf(source, pages, { title: path.basename(paths.pdf, '.pdf') })
+  await stageCapability.register(source)
+  files.push({ source, target: paths.pdf })
+  run.pdfResult = { path: paths.pdf, pages: pages.length, bytes: (await fs.promises.stat(source)).size }
+}
+
+async function assertReadyUnchanged(cache, required) {
+  for (const sp of required.filter((sp) => sp.state === 'ready')) {
+    const e = cache.spreads[sp.id]
+    if (
+      !(await verifyOwnedArtifact(e.high.path, e.high.stamp, e.high.digest)) ||
+      !(await verifyOwnedArtifact(e.low.path, e.low.stamp, e.low.digest))
+    )
+      throw new Error(`Spread ${sp.n}'s JPEGs changed during export.`)
+  }
+}
+
+/** Drop entries for other spreads whose files this export is about to overwrite. */
+function retireReplacedEntries({ prepared, files, results, next }) {
+  const written = new Set(files.map((item) => item.target))
+  const generated = new Set(
+    results
+      .filter((item) => item.state === 'prepared')
+      .map((item) => prepared.plan.spreads.find((sp) => sp.n === item.n).id),
+  )
+  for (const [id, e] of Object.entries(next.spreads)) {
+    if (!generated.has(id) && ['high', 'low'].some((k) => e[k] && written.has(e[k].path))) delete next.spreads[id]
+  }
+}
+
+function recordOwnedFiles({ prepared: { cache }, next }) {
+  next.ownedFiles = { ...(cache.ownedFiles || {}) }
+  for (const e of Object.values(cache.spreads))
+    for (const k of ['high', 'low']) if (e[k]) next.ownedFiles[e[k].path] = e[k].stamp
+}
+
+async function publishExport(run, required) {
+  const { job, prepared, next, files, stage, stageCapability } = run
+  const { cache, paths, lease } = prepared
+  const assertStillCurrent = async () => {
+    await lease.project.assertOwned()
+    await assertSnapshot(prepared, required)
+    await stageCapability.assertFiles()
+  }
+  // Cache bytes and ownership fingerprints are journaled together with the files. The
+  // builder runs before publication, so it must use staged records rather than target stats.
+  await stageCapability.transfer()
+  run.transactionOwnsStage = true // The durable publication protocol owns all later cleanup/recovery.
+  await publishDelivery(files, cache, stage, {
+    paths,
+    isCancelled: () => job.cancelled,
+    validateSnapshot: assertStillCurrent,
+    makeCache: async () => {
+      await assertStillCurrent()
+      return next
+    },
+  })
+}
+
+function finishPrepared({ job, emit, results }) {
+  for (const item of results)
+    if (item.state === 'prepared') {
+      item.state = 'done'
+      job.done++
+      emit('export.progress', { jobId: job.id, total: job.total, n: item.n, ...item })
+    }
+}
+
+function needsRecovery(e) {
+  return !!(e.recoveryStage || e.recoveryJournal || e.recoveryLock || e.snapshotPath || e.retainedPath)
+}
+
+async function exportFailed(run, e) {
+  const { job, prepared, emit, stage } = run
+  const requiresRecovery = needsRecovery(e)
+  if (
+    run.transactionOwnsStage &&
+    stage &&
+    (await fs.promises.lstat(stage).then(
+      () => true,
+      () => true,
+    ))
+  )
+    e.message += ` Inspect prepared delivery work at ${stage} and any reported recovery history before retrying; the caller did not remove it.`
+  if (e.code === 'DELIVERY_CANCELLED' && !requiresRecovery) {
+    job.cancelled = true
+    return
+  }
+  const error = e.message || String(e)
+  run.error = error
+  if (e.deliveryCommitted) {
+    job.cancelled = false
+    job.finishingErrors.push(error)
+    // The complete new set is final; retain recovery evidence for cleanup on restart.
+    finishPrepared(run)
+    emit('export.progress', { jobId: job.id, total: job.total, n: null, state: 'warning', error })
+  } else {
+    job.failed++
+    run.pdfResult = prepared.want.pdf ? { error } : null
+    emit('export.progress', { jobId: job.id, total: job.total, n: null, state: 'failed', error })
+  }
+}
+
+async function finishExport(run) {
+  const { job, prepared, emit, results, pdfResult, stageCapability } = run
+  const { paths, missingSheets, lease } = prepared
+  if (stageCapability && !run.transactionOwnsStage) {
+    try {
+      const retirement = await stageCapability.cleanup()
+      if (retirement.retainedPath)
+        job.finishingErrors.push(`Prepared delivery work was retained at ${retirement.retainedPath}.`)
+    } catch (cleanup) {
+      job.finishingErrors.push(cleanup.message)
+    }
+  }
+  if (current === job) current = null
   try {
-    await fs.promises.mkdir(path.join(paths.sheets, '.album-studio'), { recursive: true })
-    stageCapability = await createPrivateStage(path.join(paths.sheets, '.album-studio'), 'delivery-')
-    stage = stageCapability.path
-    for (let i = 0; i < spreads.length; i++) {
-      if (job.cancelled) break
-      const sp = spreads[i],
-        { n, id, psd, key, hash } = sp
-      const name = outputName(n)
-      const report = (state, extra = {}) =>
-        emit('export.progress', { jobId: job.id, index: i + 1, total: job.total, n, state, ...extra })
-      const t0 = Date.now()
-      if (!p.force && sp.state === 'ready') {
-        job.skipped++
-        results.push({ n, state: 'skipped' })
-        report('skipped')
-        continue
-      }
-      report('exporting')
-      const targets = [
-        { file: path.join(stage, `${name}-high.jpg`), quality: s.highQuality },
-        { file: path.join(stage, `${name}-low.jpg`), quality: s.lowQuality },
-      ]
-      const size = await withPrivateStage(path.dirname(stage), '.delivery-sources-', async (sourceStage) => {
-        const frozen = await sourceStage.snapshot(psd, sp.sheetDigest)
-        return exportSheet(frozen, targets, s, { expectedDigest: sp.sheetDigest, spec: prepared.ws.printSpec, n })
-      })
-      for (const target of targets) await stageCapability.register(target.file)
-      files.push({ source: targets[0].file, target: sp.high }, { source: targets[1].file, target: sp.low })
-      review.set(id, targets[1].file)
-      next.spreads[id] = {
-        n,
-        key,
-        hash,
-        psd,
-        at: new Date().toISOString(),
-        ...size,
-        high: { path: sp.high },
-        low: { path: sp.low },
-      }
-      results.push({ n, state: 'prepared', ms: Date.now() - t0, ...size })
-    }
-    if (want.pdf && !job.cancelled) {
-      const pages = plan.spreads.map((sp) => ({ path: review.get(sp.id), ppi: s.ppi }))
-      if (pages.some((page) => !page.path))
-        throw new Error('The review JPEGs are incomplete. Export the whole album first.')
-      emit('export.progress', {
-        jobId: job.id,
-        index: job.total,
-        total: job.total,
-        n: null,
-        state: 'pdf',
-        pages: pages.length,
-      })
-      const source = path.join(stage, 'review.pdf')
-      await writeJpegPdf(source, pages, { title: path.basename(paths.pdf, '.pdf') })
-      await stageCapability.register(source)
-      files.push({ source, target: paths.pdf })
-      pdfResult = { path: paths.pdf, pages: pages.length, bytes: (await fs.promises.stat(source)).size }
-    }
+    await releaseJob(lease)
+  } catch (release) {
+    job.finishingErrors.push(
+      `Delivery completed its file work, but its lease could not finish releasing: ${release.message}`,
+    )
+  }
+  const finishingError = job.finishingErrors.join(' ') || null
+  const error = [run.error, finishingError].filter(Boolean).join(' ') || null
+  emit('export.finished', {
+    jobId: job.id,
+    total: job.total,
+    done: job.done,
+    skipped: job.skipped,
+    failed: job.failed,
+    cancelled: job.cancelled,
+    ms: Date.now() - job.startedAt,
+    paths,
+    results,
+    pdf: pdfResult,
+    missingSheets,
+    error,
+    finishingError,
+    warnings: [...job.finishingErrors],
+  })
+}
+
+async function runExport(job, prepared, emit) {
+  const { plan, cache, spreads, want, paths } = prepared
+  const run = {
+    job,
+    prepared,
+    emit,
+    next: JSON.parse(JSON.stringify(cache)),
+    results: [],
+    files: [],
+    review: new Map(plan.spreads.filter((sp) => sp.state === 'ready').map((sp) => [sp.id, sp.low])),
+    pdfResult: null,
+    stage: null,
+    stageCapability: null,
+    transactionOwnsStage: false,
+    error: null,
+  }
+  try {
+    await openExportStage(run)
+    await exportSpreads(run)
+    if (want.pdf && !job.cancelled) await writeReviewPdf(run)
     if (job.cancelled) return
     const required = want.pdf ? plan.spreads : spreads
     await assertSnapshot(prepared, required)
-    for (const sp of required.filter((sp) => sp.state === 'ready')) {
-      const e = cache.spreads[sp.id]
-      if (
-        !(await verifyOwnedArtifact(e.high.path, e.high.stamp, e.high.digest)) ||
-        !(await verifyOwnedArtifact(e.low.path, e.low.stamp, e.low.digest))
-      )
-        throw new Error(`Spread ${sp.n}'s JPEGs changed during export.`)
-    }
-    const written = new Set(files.map((item) => item.target))
-    const generated = new Set(
-      results.filter((item) => item.state === 'prepared').map((item) => plan.spreads.find((sp) => sp.n === item.n).id),
-    )
-    for (const [id, e] of Object.entries(next.spreads)) {
-      if (!generated.has(id) && ['high', 'low'].some((k) => e[k] && written.has(e[k].path))) {
-        delete next.spreads[id]
-        continue
-      }
-    }
-    next.ownedFiles = { ...(cache.ownedFiles || {}) }
-    for (const e of Object.values(cache.spreads))
-      for (const k of ['high', 'low']) if (e[k]) next.ownedFiles[e[k].path] = e[k].stamp
-    if (pdfResult) next.pdf = { path: paths.pdf }
-    // Cache bytes and ownership fingerprints are journaled together with the files. The
-    // builder runs before publication, so it must use staged records rather than target stats.
-    await stageCapability.transfer()
-    transactionOwnsStage = true // The durable publication protocol owns all later cleanup/recovery.
-    await publishDelivery(files, cache, stage, {
-      paths,
-      isCancelled: () => job.cancelled,
-      validateSnapshot: async () => {
-        await lease.project.assertOwned()
-        await assertSnapshot(prepared, required)
-        await stageCapability.assertFiles()
-      },
-      makeCache: async () => {
-        await lease.project.assertOwned()
-        await assertSnapshot(prepared, required)
-        await stageCapability.assertFiles()
-        return next
-      },
-    })
+    await assertReadyUnchanged(cache, required)
+    retireReplacedEntries(run)
+    recordOwnedFiles(run)
+    if (run.pdfResult) run.next.pdf = { path: paths.pdf }
+    await publishExport(run, required)
     job.cancelled = false // Stop requested after the committed marker cannot roll back a final set.
-    for (const item of results)
-      if (item.state === 'prepared') {
-        item.state = 'done'
-        job.done++
-        emit('export.progress', { jobId: job.id, total: job.total, n: item.n, ...item })
-      }
+    finishPrepared(run)
   } catch (e) {
-    const requiresRecovery = !!(
-      e.recoveryStage ||
-      e.recoveryJournal ||
-      e.recoveryLock ||
-      e.snapshotPath ||
-      e.retainedPath
-    )
-    if (
-      transactionOwnsStage &&
-      stage &&
-      (await fs.promises.lstat(stage).then(
-        () => true,
-        () => true,
-      ))
-    )
-      e.message += ` Inspect prepared delivery work at ${stage} and any reported recovery history before retrying; the caller did not remove it.`
-    if (e.code === 'DELIVERY_CANCELLED' && !requiresRecovery) job.cancelled = true
-    else {
-      error = e.message || String(e)
-      if (e.deliveryCommitted) {
-        job.cancelled = false
-        job.finishingErrors.push(error)
-        // The complete new set is final; retain recovery evidence for cleanup on restart.
-        for (const item of results)
-          if (item.state === 'prepared') {
-            item.state = 'done'
-            job.done++
-            emit('export.progress', { jobId: job.id, total: job.total, n: item.n, ...item })
-          }
-        emit('export.progress', { jobId: job.id, total: job.total, n: null, state: 'warning', error })
-      } else {
-        job.failed++
-        pdfResult = want.pdf ? { error } : null
-        emit('export.progress', { jobId: job.id, total: job.total, n: null, state: 'failed', error })
-      }
-    }
+    await exportFailed(run, e)
   } finally {
-    if (stageCapability && !transactionOwnsStage) {
-      try {
-        const retirement = await stageCapability.cleanup()
-        if (retirement.retainedPath)
-          job.finishingErrors.push(`Prepared delivery work was retained at ${retirement.retainedPath}.`)
-      } catch (cleanup) {
-        job.finishingErrors.push(cleanup.message)
-      }
-    }
-    if (current === job) current = null
-    try {
-      await releaseJob(lease)
-    } catch (release) {
-      job.finishingErrors.push(
-        `Delivery completed its file work, but its lease could not finish releasing: ${release.message}`,
-      )
-    }
-    const finishingError = job.finishingErrors.join(' ') || null
-    error = [error, finishingError].filter(Boolean).join(' ') || null
-    emit('export.finished', {
-      jobId: job.id,
-      total: job.total,
-      done: job.done,
-      skipped: job.skipped,
-      failed: job.failed,
-      cancelled: job.cancelled,
-      ms: Date.now() - job.startedAt,
-      paths,
-      results,
-      pdf: pdfResult,
-      missingSheets,
-      error,
-      finishingError,
-      warnings: [...job.finishingErrors],
-    })
+    await finishExport(run)
   }
 }
 

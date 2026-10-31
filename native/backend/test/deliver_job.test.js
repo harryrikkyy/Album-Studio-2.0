@@ -183,7 +183,7 @@ const running = async (answers, options) => {
 
 test.beforeEach((t) => t.mock.method(Date, 'now', () => 5000))
 
-const prepared = (n, extra) => ({ n, state: 'done', ms: 0, ...SIZE, ...extra })
+const doneResult = (n, extra) => ({ n, state: 'done', ms: 0, ...SIZE, ...extra })
 const owned = (id) => ({ path: `/owned/${id}.jpg`, stamp: STAMP(id), digest: `digest${id}` })
 const entry = (extra) => ({ high: owned(1), low: owned(2), ...extra })
 
@@ -194,8 +194,8 @@ test('two sheets export and publish', async () => {
   assert.deepEqual(progress(), [
     { jobId: 'job', index: 1, total: 2, n: 1, state: 'exporting' },
     { jobId: 'job', index: 2, total: 2, n: 2, state: 'exporting' },
-    { jobId: 'job', total: 2, n: 1, ...prepared(1) },
-    { jobId: 'job', total: 2, n: 2, ...prepared(2) },
+    { jobId: 'job', total: 2, n: 1, ...doneResult(1) },
+    { jobId: 'job', total: 2, n: 2, ...doneResult(2) },
   ])
   assert.deepEqual(finished, {
     jobId: 'job',
@@ -206,7 +206,7 @@ test('two sheets export and publish', async () => {
     cancelled: false,
     ms: 0,
     paths: PATHS,
-    results: [prepared(1), prepared(2)],
+    results: [doneResult(1), doneResult(2)],
     pdf: null,
     missingSheets: [],
     error: null,
@@ -260,7 +260,7 @@ test('a ready sheet is skipped', async () => {
 
 test('a ready sheet exports when forced', async () => {
   const { finished } = await running({}, { spreads: [READY], cache: READY_CACHE, p: { force: true } })
-  assert.deepEqual(finished.results, [prepared(1)])
+  assert.deepEqual(finished.results, [doneResult(1)])
   assert.equal(finished.skipped, 0)
 })
 
@@ -412,6 +412,15 @@ test("a ready sheet's low JPEG changing fails the export", async () => {
   assert.deepEqual(named('verifyOwnedArtifact')[1], ['verifyOwnedArtifact', '/owned/2.jpg', STAMP(2), 'digest2'])
 })
 
+test('a changed album is reported ahead of changed JPEGs, which are not looked at', async () => {
+  const { finished, named } = await running(
+    { readFile: () => '{"project":2}', verifyOwnedArtifact: () => false },
+    { spreads: [READY], cache: READY_CACHE },
+  )
+  assert.equal(finished.error, 'The album changed during export. Export again from the current revision.')
+  assert.deepEqual(named('verifyOwnedArtifact'), [])
+})
+
 test('only ready sheets are checked for that', async () => {
   const { named } = await running()
   assert.deepEqual(named('verifyOwnedArtifact'), [])
@@ -419,13 +428,13 @@ test('only ready sheets are checked for that', async () => {
 
 // ── the cache to publish ────────────────────────────────────────────────────
 
-/** The cache handed back by makeCache. */
+/** The cache as makeCache hands it to publication. */
 async function nextCache(options, answers = {}) {
   let next
   const h = harness(
     {
       publishDelivery: async (files, cache, stage, hooks) => {
-        next = await hooks.makeCache()
+        next = structuredClone(await hooks.makeCache())
       },
       ...answers,
     },
@@ -564,6 +573,20 @@ test('a failure after the transfer points at the work and leaves it', async () =
   assert.deepEqual(named('lstat'), [['lstat', STAGE]])
 })
 
+test('no sheet is done until the delivery commits', async () => {
+  const seen = []
+  const h = harness({
+    publishDelivery: () => {
+      seen.push(h.job.done, h.progress().filter((p) => p.state === 'done').length)
+      fail('journal full')
+    },
+  })
+  const finished = await h.run()
+  assert.deepEqual(seen, [0, 0])
+  assert.equal(finished.done, 0)
+  assert.deepEqual(finished.results, [doneResult(1, { state: 'prepared' }), doneResult(2, { state: 'prepared' })])
+})
+
 test('a failure before the transfer says nothing of it, and cleans up', async () => {
   const { finished, named } = await running({ transfer: () => fail('not transferred') })
   assert.equal(finished.error, 'not transferred')
@@ -610,10 +633,10 @@ test('a committed delivery with a recovery failure reports both', async () => {
   assert.deepEqual(finished.warnings, [error])
   assert.equal(finished.finishingError, error)
   assert.equal(finished.error, `${error} ${error}`)
-  assert.deepEqual(finished.results, [prepared(1), prepared(2)])
+  assert.deepEqual(finished.results, [doneResult(1), doneResult(2)])
   assert.deepEqual(h.progress().slice(-3), [
-    { jobId: 'job', total: 2, n: 1, ...prepared(1) },
-    { jobId: 'job', total: 2, n: 2, ...prepared(2) },
+    { jobId: 'job', total: 2, n: 1, ...doneResult(1) },
+    { jobId: 'job', total: 2, n: 2, ...doneResult(2) },
     { jobId: 'job', total: 2, n: null, state: 'warning', error },
   ])
 })

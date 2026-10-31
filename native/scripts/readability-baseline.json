@@ -10,8 +10,7 @@
     "max-len": 1
   },
   "native/backend/lib/deliver.js": {
-    "max-len": 2,
-    "complexity": 1
+    "max-len": 2
   },
   "native/backend/lib/delivery_transaction.js": {
     "max-len": 1
