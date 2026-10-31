@@ -357,7 +357,7 @@ async function buildPhotoLayer(sharp, photo, frame, scale, smartCrop) {
 
   // Every source failed — re-throw the last libvips error with extra context
   // so the page-level handler can surface a useful toast.
-  const tried = sources.map((s) => s.split('/').pop()).join(' / ')
+  const tried = sources.map((s) => (typeof s === 'string' ? s.split('/').pop() : 'photo in memory')).join(' / ')
   const err = new Error(`unreadable source [${tried}]: ${lastErr?.message || 'unknown'}`)
   err.cause = lastErr
   throw err

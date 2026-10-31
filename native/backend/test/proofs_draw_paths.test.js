@@ -575,9 +575,10 @@ test('a photo that cannot be read is reported and the others are drawn', async (
   looksLike(page.at([75, 30]), BLUE)
 })
 
-test("a buffered photo that cannot be read is skipped, today with the renderer's own slip for a message", async () => {
+test('a buffered photo that cannot be read is skipped and named as a photo in memory', async () => {
   const { page, result } = await drawn({ photos: { a: Buffer.from('not a picture') } }, { buffered: true })
-  assert.deepEqual(result.skipped, ['s.split is not a function'])
+  assert.equal(result.skipped.length, 1)
+  assert.match(result.skipped[0], /^unreadable source \[photo in memory\]: /)
   looksLike(page.at(INSIDE), WHITE)
 })
 
