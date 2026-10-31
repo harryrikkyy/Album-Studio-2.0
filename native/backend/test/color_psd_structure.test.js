@@ -23,6 +23,8 @@ const C = (detail) =>
 const ALPHA = [0xff, 0xff]
 const NO_ALPHA = [0, 1]
 const compressed = Buffer.from([0, 1]) // a composite that isn't raw, so no sample bytes are needed
+// An empty merged-composite resource that says it holds 100 bytes: too long, and too short to read.
+const CUT_MERGED = Buffer.concat([resource(1057, Buffer.alloc(0)).subarray(0, 8), u32(100)])
 const changed = (doc, change) => {
   change(doc)
   return doc
@@ -52,6 +54,9 @@ for (const [name, file, detail] of [
   ['a raw 16-bit composite one byte short', psd({ depth: 16, data: Buffer.alloc(25) }), 'truncated document data'],
   ['a layer length equal to the file', changed(psd(), (d) => d.writeUInt32BE(d.length, 34)), 'truncated document data'],
   ['a layer info section past the layers', psd({ layers: Buffer.concat([u32(4), u32(0)]) }), 'truncated document data'],
+  ['a layer info section with no room at all', psd({ layers: u32(1) }), 'truncated document data'],
+  ['a mask one byte past the layers', psd({ layers: Buffer.concat([u32(0), u32(1)]) }), 'truncated document data'],
+  ['a file cut inside the layer length', psd().subarray(0, 36), 'truncated document data'],
   [
     'a mask length past the layers',
     psd({ layers: Buffer.concat([u32(0), u32(9), u32(0)]) }),
@@ -206,6 +211,46 @@ for (const [name, file, detail] of [
     'first failure wins: a bad block, then bad RGB channels',
     psd({ channels: 2, layers: layerSection(null, [block('Layr', NO_ALPHA, { signature: '8BXX' })]) }),
     'invalid global layer block',
+  ],
+  [
+    'first failure wins: a bad block, then nothing after the layers',
+    psd({ layers: layerSection(null, [block('Layr', NO_ALPHA, { signature: '8BXX' })]), data: Buffer.alloc(0) }),
+    'invalid global layer block',
+  ],
+  [
+    'first failure wins: padding, then too little for a block',
+    psd({ layers: layerSection(null, [Buffer.alloc(1), Buffer.from('XXXXXXXXXXX')]) }),
+    'truncated document data',
+  ],
+  [
+    'first failure wins: a block past the layers that disagrees with the last',
+    psd({
+      layers: layerSection(null, [
+        block('Layr', NO_ALPHA),
+        Buffer.concat([Buffer.from('8BIMLayr'), u32(4), Buffer.from(ALPHA)]),
+      ]),
+    }),
+    'truncated document data',
+  ],
+  [
+    'first failure wins: a layer count cut short, with nothing after it',
+    psd({ layers: layerSection(null, [block('Layr', [0])]), data: Buffer.alloc(0) }),
+    'truncated layer count',
+  ],
+  [
+    'first failure wins: 5 channels, with transparency declared',
+    psd({ channels: 5, layers: layerSection(-1) }),
+    'unsupported RGB extra channels',
+  ],
+  [
+    'first failure wins: 4 channels with no declaration, then short data',
+    psd({ channels: 4, data: Buffer.alloc(3) }),
+    'fourth-channel transparency provenance is unknown',
+  ],
+  [
+    'first failure wins: a resource too long, and too short to read',
+    psd({ resources: [CUT_MERGED] }),
+    'truncated document data',
   ],
 ]) {
   test(`compositeMetadata refuses ${name}`, () => {
@@ -590,6 +635,16 @@ for (const [name, file, message] of [
     'first failure wins: a missing plane, then short data',
     cmyk({ layers: layerSection(-1), data: Buffer.alloc(3) }),
     'transparency plane is missing',
+  ],
+  [
+    'first failure wins: a resource too long, and too short to read',
+    cmyk({ resources: [CUT_MERGED] }),
+    'truncated resource',
+  ],
+  [
+    'first failure wins: a fifth channel unidentified, then a bad ZIP',
+    cmyk({ channels: 5, data: Buffer.concat([u16(2), Buffer.from([1, 2, 3])]) }),
+    'an extra channel is not identified as transparency',
   ],
 ]) {
   test(`decodeCmykComposite refuses ${name}`, () => {

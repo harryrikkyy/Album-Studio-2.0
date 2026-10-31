@@ -43,6 +43,7 @@ const PROFILE = 'The sheet has an invalid colour profile. Assign a valid profile
 const plain = { width: 3, height: 2, components: 3, profile: null }
 
 for (const [name, file, message] of [
+  ['one byte', raw(0xff), SIGNATURE],
   ['three bytes', raw(0xff, 0xd8, 0xff), SIGNATURE],
   ['no start marker', raw(0xff, 0xd9, 0, 0), SIGNATURE],
   ['junk where a marker belongs', raw(0xff, 0xd8, 0, 0, 0, 0), MARKER],
@@ -122,6 +123,7 @@ for (const [name, file, message] of [
     DIMENSIONS,
   ],
   ['first failure wins: a missing ICC chunk, with a bad profile', ok(icc(2, 3, [1, 2, 3])), ICC_MISSING],
+  ['first failure wins: a stray byte, then what looks like a segment', raw(0xff, 0xd8, 0x12, 0xe0, 0xff, 0xff), MARKER],
 ]) {
   test(`refuses ${name}`, () => {
     assert.throws(() => jpegInfo(file), { message })
