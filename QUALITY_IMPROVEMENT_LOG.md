@@ -92,12 +92,12 @@ Phase 4b-3 split the 16 functions above complexity 20 in the rendering, colour, 
 functions had less testing than the last batch, so each was pinned first, using exact branch marks
 on a copy of the old code: tests reached 1,255 of their 1,814 branch outcomes before and 1,796 now.
 The 18 left can't be reached, because an earlier check or the way a value is read rules them out.
-Backend tests rose from 930 to 1,985, and backend coverage from 95.5% to 96.6% of lines and from
-89.3% to 92.2% of branches. Of 1,265 deliberate mutants of the 16 functions, 1,243 were caught; the
-other 22 change nothing a test could see, being equivalent code, dead writes or the unreachable
-outcomes above. A 30-second limit first counted timed-out mutants as caught, which hid two real
-survivors in `runExport` until the limit rose to 120 seconds. Those two now have a test, and the
-other 8 timeouts, rerun on the old code, are real hangs.
+Backend tests rose from 930 to 2,030, and backend coverage from 95.5% to 96.6% of lines and from
+89.3% to 92.2% of branches. Of 1,265 mutants of the 16 functions that change an operator or a value,
+1,243 were caught; the other 22 are equivalent code, dead writes or the unreachable outcomes above. A
+30-second limit first counted timed-out mutants as caught, which hid two real survivors in
+`runExport` until the limit rose to 120 seconds. Those two now have a test, and the other 8 timeouts,
+rerun on the old code, are real hangs.
 
 Each split was then compared with the original, with 0 differences: 756,000 random or changed
 inputs, including 6,000 whole albums through preflight; 44 authored `psdPixels` cases; 75,987 runs
@@ -106,12 +106,28 @@ differently; and 4,382 runs with each file-system call failing once or from then
 mutants of the new code, 180 were caught by the comparison they were aimed at and 9 by another; the
 last 3 are an unreachable branch and a dead write. The sweeps never reach a developed photo, a font
 edit, a turned photo, a bad selection or a proof refresh, so those paths rest on the collaborator
-comparisons and the pins. No moved per-pixel loop slowed by more than 3.6%. Pinning found two real
-bugs, each fixed after the unchanged split in its own commit, with a test that failed first: photos
-on a page with no template picture and no preview failed with 'Input buffer contains unsupported
-image format', and an unreadable photo in a buffered preview reported 's.split is not a function'
-instead of naming the photo. Testing stays at 8, because its target needs the component,
-accessibility and rule tests of phase 5, and Readability stays at 7 until more of the 31 fall.
+comparisons and the pins. No moved per-pixel loop slowed by more than 3.6%. Pinning also found two
+faults, each fixed after the unchanged split in its own commit with a test that failed first, though
+no user could have met either. The blank-page proof path couldn't lay photos on, failing with 'Input
+buffer contains unsupported image format', but real template art always has a backdrop, so that path
+only runs when a test stubs `templateArt`. A photo unreadable from memory was skipped with the note
+'s.split is not a function'; the note now says it couldn't be read, but nothing in the interface
+shows these notes, and it still doesn't name the photo.
+
+The final review found no change in behaviour, and 1,500,000 more random inputs showed 0 differences,
+but it did show the pins were weaker than these numbers suggest. A harder mutator, which drops an
+`await`, swaps neighbouring statements or deletes one, made 1,909 mutants of the eight files: 561
+passed the pin files, and of 66 mutants run on the whole suite, 8 of them written by hand, 62 still
+passed. Fakes of asynchronous work answered at once, so a dropped `await` changed nothing a row could
+see, and a row that breaks one rule can't show which of two checks runs first. One fix pass made
+those fakes take a turn, as the real calls do, and added 45 tests: albums and files that break two
+rules at once, integrity checks that only the comparisons had been guarding, and how a proof is
+saved. Of the 62, 53 now fail a test. The other 9 swap neighbouring statements that don't depend
+on each other, except one that matters only if the engine's reply has no layer list. Five more hand
+mutants, first run on the whole suite in this pass, also pass it: none changes anything a user could
+see, short of a project file edited by hand. Testing stays at 8, because its target needs the
+component, accessibility and rule tests of phase 5, and Readability stays at 7 until more of the 31
+fall.
 
 ## Phases
 
@@ -162,8 +178,12 @@ accessibility and rule tests of phase 5, and Readability stays at 7 until more o
   checked' is thrown inside a `try` whose `catch` swallows it, so the code falls through to a full
   decode, which verifies. `applyFrameEdit` writes `f.hidden` and `f.opacity`, which are recomputed
   for every frame straight after, so nothing reads them. In `frozenPhotos`, `ph.original ||
-  ph.thumb` never reads `ph.thumb`, because a `sourceKey` only comes with an original. Later
-  batches count a timed-out mutant as caught only if it's a real hang.
+  ph.thumb` never reads `ph.thumb`, because a `sourceKey` only comes with an original. The `lstat`
+  test in `exportFailed` is always true, because both of its outcomes answer true. A proof's
+  `skipped` notes reach the `proofs.updated` event and stop there, and they don't name the photo.
+  Later batches count a timed-out mutant as caught only if it's a real hang, run the review's
+  dropped-`await`, swap and delete mutants beside the operator ones, and make a fake take a turn
+  whenever the real call does.
 - CI: the engine pin at `5301ba3` holds on GitHub as well as locally. Run 41062213208 on `3c0ac25`
   passed all three jobs, including the native workspace job that had failed on all three earlier
   finished runs of this branch. Run 41076354641 on `13b90ce`, the first on `Album-Studio-2.0`,
