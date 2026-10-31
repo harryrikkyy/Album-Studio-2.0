@@ -116,7 +116,7 @@ async function scene(row = {}) {
     ...row.art,
   }
   if (row.backdrop) {
-    const bytes = await solid(row.backdrop, 200, 120)
+    const bytes = Array.isArray(row.backdrop) ? await solid(row.backdrop, 200, 120) : row.backdrop
     art.backdrop = place('backdrop.png', bytes)
     art.artifactDigests[art.backdrop] = sha(bytes)
   }
@@ -312,6 +312,41 @@ test('the page starts from the backdrop, ahead of a preview', async () => {
   const { page } = await drawn({ backdrop: BLUE, preview: GREEN })
   assert.deepEqual(page.size, [100, 60])
   looksLike(page.at(OUTSIDE), BLUE)
+})
+
+test('a backdrop of another shape is stretched to the page, not cropped', async () => {
+  // A 100×100 picture, green along its top fifth: cropped to the page's shape, the green would go.
+  const backdrop = await sharp(await solid(BLUE, 100, 100))
+    .composite([{ input: await solid(GREEN, 100, 20), top: 0, left: 0 }])
+    .png()
+    .toBuffer()
+  const s = await scene({ backdrop })
+  const page = await picture((await s.draw({ buffered: true })).jpeg)
+  looksLike(page.at([10, 5]), GREEN)
+  looksLike(page.at([10, 40]), BLUE)
+})
+
+test('a damaged backdrop draws as far as it can be read', async () => {
+  const whole = await sharp(await solid(BLUE, 200, 120))
+    .jpeg()
+    .toBuffer()
+  const s = await scene({ backdrop: whole.subarray(0, whole.length - 30) })
+  const page = await picture((await s.draw({ buffered: true })).jpeg)
+  looksLike(page.at(OUTSIDE), BLUE)
+})
+
+test('a published proof is saved at quality 85 with mozjpeg', async (t) => {
+  const jpeg = t.mock.method(sharp.prototype, 'jpeg')
+  const s = await scene()
+  await s.draw()
+  assert.deepEqual(jpeg.mock.calls.at(-1).arguments, [{ quality: 85, mozjpeg: true }])
+})
+
+test('a buffered preview is saved at quality 85 without mozjpeg', async (t) => {
+  const jpeg = t.mock.method(sharp.prototype, 'jpeg')
+  const s = await scene()
+  await s.draw({ buffered: true })
+  assert.deepEqual(jpeg.mock.calls.at(-1).arguments, [{ quality: 85 }])
 })
 
 test('with no backdrop the page starts from the preview', async () => {
