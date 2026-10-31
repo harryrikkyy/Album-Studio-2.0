@@ -404,3 +404,99 @@ test('renderPageProof writes the same page for each job', async () => {
     assert.equal((await renderPageProof({ ...job, outputPath: job.outputPath + '.again.jpg' })).hash, result.hash, name)
   }
 })
+
+// ─── stack slots ─────────────────────────────────────────────────────────────
+
+test('an edited page keeps each photo at its frame’s place in the layer stack', async () => {
+  const f = await fixtures()
+  // Solid colours, so the pixel checks don't depend on the JPEG encoder.
+  const solid = async (name, width, height, background) => {
+    const file = path.join(f.dir, name)
+    await sharp({ create: { width, height, channels: 3, background } }).toFile(file)
+    return file
+  }
+  const paper = await solid('paper.png', 400, 300, '#ffffff')
+  const red = await solid('red.jpg', 180, 120, '#e00000')
+  const green = await solid('green.jpg', 180, 120, '#00c000')
+  const blue = await solid('blue.jpg', 100, 200, '#0000e0')
+  const layer = (id, name, box, extra) => ({ id, name, kind: 'raster', visible: true, opacity: 1, ...box, ...extra })
+  const hBox = { x: 100, y: 60, w: 180, h: 120 }
+  const vBox = { x: 150, y: 40, w: 100, h: 200 }
+  const paperLayer = layer('0', 'Paper', { x: 0, y: 0, w: 400, h: 300 }, { png: paper })
+  const frameLayer = (id, name, box) => layer(id, name, box, { isFrame: true })
+  const hFrame = { name: 'toolkithframe1', ...hBox }
+  const vFrame = { name: 'toolkitvframe1', ...vBox }
+  // Two frames sharing a name, side by side.
+  const left = { x: 10, y: 60, w: 180, h: 120 }
+  const right = { x: 200, y: 60, w: 180, h: 120 }
+
+  for (const [name, frames, photos, psdLayers, expected] of [
+    [
+      'the v frame above the h frame keeps its photo on top',
+      [hFrame, vFrame],
+      [
+        { filePath: red, orient: 'h' },
+        { filePath: blue, orient: 'v' },
+      ],
+      [paperLayer, frameLayer('1', hFrame.name, hBox), frameLayer('2', vFrame.name, vBox)],
+      { sha256: 'efa215f756808685301e6589940c09ce185e322c8a2be13239f8e0b660d0c034', pixels: [[200, 100, [0, 0, 224]]] },
+    ],
+    [
+      'the h frame above the v frame keeps its photo on top',
+      [hFrame, vFrame],
+      [
+        { filePath: red, orient: 'h' },
+        { filePath: blue, orient: 'v' },
+      ],
+      [paperLayer, frameLayer('1', vFrame.name, vBox), frameLayer('2', hFrame.name, hBox)],
+      { sha256: '6ff692446706526dc227517139f132d65d00876be4be72e3168f3bf9e91054c6', pixels: [[200, 100, [224, 0, 0]]] },
+    ],
+    [
+      // Today's behaviour, not a promise: both photos land in the later slot, the second built
+      // replaces the first, and the first frame stays empty.
+      'two frames with one name share a slot, and one photo is lost',
+      [
+        { name: 'toolkithframe1', ...left },
+        { name: 'toolkithframe1', ...right },
+      ],
+      [
+        { filePath: red, orient: 'h' },
+        { filePath: green, orient: 'h' },
+      ],
+      [paperLayer, frameLayer('1', 'toolkithframe1', left), frameLayer('2', 'toolkithframe1', right)],
+      {
+        sha256: 'c766490c04a2b3685f09b596c47324847fef0724d642345c10d52d88cc0afb0b',
+        pixels: [
+          [290, 100, [0, 192, 0]],
+          [100, 100, [255, 255, 255]],
+        ],
+      },
+    ],
+  ]) {
+    const job = {
+      templatePath: path.join(f.dir, 'template.psd'),
+      frames,
+      canvasWidth: 400,
+      canvasHeight: 300,
+      smartCrop: false,
+      photos,
+      psdLayers,
+      layerEdits: { 0: { dx: 0 } },
+      maxEdge: 400,
+      outputPath: path.join(f.dir, 'out', `${sha256(Buffer.from(name)).slice(0, 8)}.jpg`),
+    }
+    const result = await renderPageProof(job)
+    assert.equal(result.ok, true, `${name}: ${result.error}`)
+    assert.equal(sha256(fs.readFileSync(job.outputPath)), expected.sha256, name)
+    const { data, info } = await sharp(job.outputPath).removeAlpha().raw().toBuffer({ resolveWithObject: true })
+    for (const [x, y, colour] of expected.pixels) {
+      const at = (y * info.width + x) * info.channels
+      colour.forEach((value, channel) =>
+        assert.ok(
+          Math.abs(data[at + channel] - value) <= 12,
+          `${name}: (${x},${y}) channel ${channel} is ${data[at + channel]}`,
+        ),
+      )
+    }
+  }
+})
