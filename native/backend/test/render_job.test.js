@@ -777,6 +777,19 @@ test('a failed clean-up ends the job, with the stage retired first', async () =>
   assert.deepEqual(order, ['closeAll', 'cleanup', 'session.close'])
 })
 
+test('the stage retires only once the engine clean-up has finished', async () => {
+  const order = []
+  await finished({
+    ...onceBroken(),
+    closeAll: async () => {
+      await new Promise(setImmediate)
+      order.push('engine clean')
+    },
+    cleanup: () => order.push('stage retired'),
+  })
+  assert.deepEqual(order, ['engine clean', 'stage retired'])
+})
+
 test('a stage that will not retire goes in the finishing errors, and the result stands', async () => {
   const h = await finished({ cleanup: () => fail('still in use') })
   assert.deepEqual(h.job.results, [doneResult()])

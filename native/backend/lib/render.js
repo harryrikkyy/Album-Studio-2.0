@@ -167,276 +167,363 @@ async function startRender(p, { emit }) {
   }
 }
 
+function assertRenderable(s) {
+  if (!s.template || !s.template.file)
+    throw new Error(s.template ? `the template ${s.template.name} isn't on disk` : 'the spread has no template')
+  if (!s.photoIds.length) throw new Error('the spread has no photos')
+}
+
+/** Edited by hand in the editor: never replaced without being asked. */
+const editedSheet = (record, existingBefore, overwriteEdited) =>
+  !!existingBefore && !overwriteEdited && (!verifiedSheetRecord(record) || record.sheetDigest !== existingBefore.digest)
+
+async function sheetIsCurrent(run, work, existingBefore, hash) {
+  return (
+    !run.force &&
+    !!existingBefore &&
+    entryHash(work.record) === hash &&
+    (await meetsPrintResolution(work.existingPath, run.settings, existingBefore.digest))
+  )
+}
+
+function spreadSkipped(run, work, extra = {}) {
+  run.job.skipped++
+  work.report('skipped', extra)
+  run.job.results.push({ n: work.s.n, state: 'skipped', ...extra })
+}
+
+/** Each photo, developed, adjusted and frozen in the spread's private stage. */
+async function freezePhotos(run, work, inputValues) {
+  const { album, ws, paths } = run
+  const { s, privateStage, privateFiles } = work
+  /** @type {Array<{ file: string, digest: string, orient: 'h' | 'v', name: string, edit: object }>} */
+  const photos = []
+  for (const id of s.photoIds) {
+    const ph = album.photos[id]
+    if (!ph || !ph.original)
+      throw new Error(`The original photo ${id} is missing; thumbnails cannot be rendered for print.`)
+    const src = ph.original
+    const expectedSource = inputValues[2].find((v) => v[0] === id)[2]
+    const developed = await placeableEvidence(src, paths.raw)
+    if (developed.sourceKey !== contentKey(src, expectedSource))
+      throw new Error('The original changed before its render snapshot was made.')
+    const adjusted = await bakeAdjustmentsEvidence(developed.file, (ws.imageAdjustments || {})[id], paths.adjusted)
+    if (adjusted.sourceKey !== contentKey(developed.file, developed.digest))
+      throw new Error('The developed image changed before its adjustment snapshot was made.')
+    const frozen = await privateStage.snapshot(adjusted.file, adjusted.digest)
+    privateFiles.set(frozen, adjusted.digest)
+    photos.push({
+      file: frozen,
+      digest: adjusted.digest,
+      orient: ph.orient === 'v' ? 'v' : 'h',
+      name: ph.base,
+      edit: { rotation: (ws.imageRotations || {})[id] || 0, ...((ws.imagePlacements || {})[id] || {}) },
+    })
+  }
+  return photos
+}
+
+async function buildStagedSheet(run, work, template, photos) {
+  const { job, ws, settings } = run
+  const { s, report, stagedPsd, preview } = work
+  report('building')
+  if (!run.pc) run.pc = new PhotoCraftSession({ writeRoot: job.outputFolder })
+  return buildSheet(run.pc, {
+    template,
+    photos,
+    layerEdits: (ws.pageLayerEdits || {})[s.n] || null,
+    overlays: (ws.pageOverlays || {})[s.n] || null,
+    outPsd: stagedPsd,
+    outJpg: preview,
+    printSettings: settings,
+  })
+}
+
+/** What publication checks last: nothing changed under the sheet while it was built. */
+function snapshotValidator(run, work, hash) {
+  const { album, ws, projectText } = run
+  const { s, privateStage, privateFiles, stagedPsd, sourceStage } = work
+  return async () => {
+    if ((await fs.promises.readFile(album.file, 'utf8')) !== projectText || (await spreadHash(s, album, ws)) !== hash)
+      throw new Error('The project or source files changed during rendering. Retry from the current revision.')
+    await privateStage.assertFiles()
+    if (
+      (
+        await Promise.all(
+          [...privateFiles]
+            .filter(([file]) => file !== stagedPsd)
+            .map(async ([file, expected]) => (await fileDigest(file)) === expected),
+        )
+      ).some((ok) => !ok)
+    ) {
+      throw new Error(`A private render source changed during construction. Preserve ${sourceStage} before retrying.`)
+    }
+  }
+}
+
+function cacheWithSheet(run, work, hash, preflight) {
+  return {
+    ...run.cache,
+    spreads: {
+      ...run.cache.spreads,
+      [work.s.id]: {
+        path: work.outPsd,
+        outputFolder: run.job.outputFolder,
+        hash,
+        settings: run.settings,
+        resolutionEvidence: preflight.info.filter((e) => e.code === 'effective_ppi'),
+      },
+    },
+  }
+}
+
+const committedWithoutHistory = (error, outPsd) =>
+  !!error.renderCommitted &&
+  !!error.cache &&
+  !!error.cacheRevision &&
+  !!error.sheetRecord &&
+  error.sheetRecord.path === outPsd
+
+/** Publishes the sheet; an error after its commit counts as published, with a warning to review. */
+async function publishSheet(run, work, request, committedWarnings) {
+  const { job, lease, projectText } = run
+  try {
+    return await publishRender(
+      { ...request, expectedProjectRevision: revisionOf(projectText) },
+      {
+        assertOwned: () => lease.project.assertOwned(),
+        assertOutput: (requested) => lease.project.outputNamespace.assertFor(requested),
+        isCancelled: () => job.cancelled,
+        validateSnapshot: work.validateSnapshot,
+      },
+    )
+  } catch (error) {
+    if (!committedWithoutHistory(error, work.outPsd)) throw error
+    committedWarnings.push(
+      `The print sheet and ownership record were committed. Recovery history needs review: ${error.message}`,
+    )
+    return error
+  }
+}
+
+/**
+ * Proofs are derived. A failure after durable commit must report the saved sheet,
+ * rather than claim that the render failed or that the old pair was restored.
+ */
+async function refreshSheetProof(run, work, inputValues, committedWarnings) {
+  const { album, ws, projectText, lease, proofDir, emit } = run
+  const { s, outPsd, preview, stagedProof, privateStage, privateFiles } = work
+  try {
+    await sipsResize(preview, stagedProof, 2400)
+    const proofDigest = await fileDigest(stagedProof)
+    await privateStage.register(stagedProof, { digest: proofDigest })
+    privateFiles.set(stagedProof, proofDigest)
+    await recordSheetProof(album, ws, s, outPsd, {
+      proof: stagedProof,
+      expectedHash: proofInputHash(inputValues),
+      projectText,
+      lease: lease.project,
+    })
+    privateStage.forget(stagedProof)
+    emit('proofs.updated', {
+      album: album.path,
+      n: s.n,
+      proof: path.join(proofDir, `live_page_${String(s.n).padStart(3, '0')}.jpg`),
+      source: 'sheet',
+    })
+  } catch (error) {
+    committedWarnings.push(
+      `The print sheet is saved, but its preview could not be refreshed: ${error.message} Refresh previews after resolving this problem.`,
+    )
+  }
+}
+
+/** A spread from its checks to its result. A spread with nothing to do returns early. */
+async function renderSheet(run, work) {
+  const { job, album, ws, settings, lease, overwriteEdited, paths } = run
+  const { s, name, record, existingPath, outPsd, report, t0, privateFiles } = work
+  await lease.project.assertOwned()
+  assertRenderable(s)
+  const existingBefore = existingPath ? await fingerprintRenderFile(existingPath) : null
+  const sheetBefore = existingPath === outPsd ? existingBefore : await fingerprintRenderFile(outPsd)
+  if (sheetBefore && existingPath !== outPsd)
+    throw new Error(`An unowned sheet exists at ${outPsd}. Preserve it before rendering.`)
+  if (editedSheet(record, existingBefore, overwriteEdited)) return spreadSkipped(run, work, { reason: 'edited' })
+  const inputValues = await spreadInputs(s, album, ws)
+  const hash = renderInputHash(inputValues)
+  if (await sheetIsCurrent(run, work, existingBefore, hash)) return spreadSkipped(run, work)
+  report('preparing')
+  const preflight = await preflightAlbum(
+    album,
+    ws,
+    { ...settings, phase: 'render' },
+    [s.n],
+    new Map([[s.n, inputValues]]),
+  )
+  if (preflight.errors.length) throw new Error(preflight.errors.map((e) => e.message).join(' '))
+  await fs.promises.mkdir(path.dirname(outPsd), { recursive: true })
+  const privateStage = (work.privateStage = await createPrivateStage(paths.dir, 'render-sources-'))
+  work.sourceStage = privateStage.path
+  const stagedPsd = (work.stagedPsd = path.join(work.sourceStage, `${name}.${crypto.randomUUID()}.part.psd`))
+  const preview = (work.preview = path.join(work.sourceStage, `${name}.${crypto.randomUUID()}.jpg`))
+  work.stagedProof = `${stagedPsd}.proof.jpg`
+  const template = await privateStage.snapshot(s.template.file, inputValues[1])
+  privateFiles.set(template, inputValues[1])
+  const warnings = unsupportedEdits(s, ws)
+  const photos = await freezePhotos(run, work, inputValues)
+  const built = await buildStagedSheet(run, work, template, photos)
+  if (built.warnings.length)
+    throw new Error(`Sheet construction left edits or photos unapplied: ${built.warnings.join('; ')}`)
+  const stagedDigest = await fileDigest(stagedPsd)
+  await privateStage.register(stagedPsd, { digest: stagedDigest })
+  privateFiles.set(stagedPsd, stagedDigest)
+  const previewDigest = await fileDigest(preview)
+  await privateStage.register(preview, { digest: previewDigest })
+  privateFiles.set(preview, previewDigest)
+  work.validateSnapshot = snapshotValidator(run, work, hash)
+  const cacheNext = cacheWithSheet(run, work, hash, preflight)
+  const committedWarnings = []
+  const publication = await publishSheet(
+    run,
+    work,
+    {
+      albumFile: album.file,
+      outputFolder: job.outputFolder,
+      spreadId: s.id,
+      source: stagedPsd,
+      sourceDigest: stagedDigest,
+      sheetBefore,
+      cacheBefore: run.cacheRevision,
+      cacheNext,
+    },
+    committedWarnings,
+  )
+  run.cache = publication.cache
+  run.cacheRevision = publication.cacheRevision
+  await refreshSheetProof(run, work, inputValues, committedWarnings)
+  job.done++
+  const r = {
+    n: s.n,
+    state: 'done',
+    committed: true,
+    ms: Date.now() - t0,
+    path: outPsd,
+    warnings: [...warnings, ...built.warnings, ...committedWarnings],
+  }
+  job.results.push(r)
+  report('done', { ms: r.ms, warnings: r.warnings })
+}
+
+/** Records a spread's failure; returns 'stop' when it was the job being cancelled. */
+async function spreadFailed(run, work, e) {
+  const { job, pc } = run
+  const { s, report } = work
+  if (e.code === 'RENDER_CANCELLED' && !e.recoveryRequired) {
+    job.results.push({ n: s.n, state: 'cancelled', reason: 'stopped before commit' })
+    report('cancelled', { reason: 'stopped before commit' })
+    return 'stop'
+  }
+  job.failed++
+  const error = e && e.message ? e.message : String(e)
+  job.results.push({ n: s.n, state: 'failed', error })
+  report('failed', { error })
+  // A dead engine is replaced for the next sheet; a live one is cleaned up.
+  if (pc && pc.proc.exitCode !== null) run.pc = null
+  else if (pc) await closeAll(pc)
+}
+
+/**
+ * Retire the complete capability atomically. Digest-check followed by unlink
+ * cannot protect a name replaced at the final boundary on this filesystem.
+ */
+async function retireRenderStage(run, work) {
+  if (!work.privateStage) return
+  try {
+    await work.privateStage.cleanup()
+  } catch (error) {
+    run.job.finishingErrors.push(`Private render work needs review: ${error.message}`)
+  }
+}
+
+/**
+ * One spread. An error from the record or path lookups ends the job, so they stay outside the `try`.
+ * The `return await`s keep `finally` from retiring the stage before the helper ends.
+ */
+async function renderSpread(run, s, i) {
+  const { job, album, ws, emit } = run
+  const name = outputName(s.n)
+  const record = await ownedSheetRecord(ws, album.path, s.id, run.cache)
+  const existingPath = record && record.path
+  const outPsd = canonicalSheetPath(job.outputFolder, s.id)
+  const report = (state, extra = {}) =>
+    emit('render.progress', { jobId: job.id, index: i + 1, total: job.total, n: s.n, state, ...extra })
+  const work = {
+    s,
+    name,
+    record,
+    existingPath,
+    outPsd,
+    report,
+    t0: Date.now(),
+    sourceStage: null,
+    privateStage: null,
+    privateFiles: new Map(),
+  }
+  try {
+    return await renderSheet(run, work)
+  } catch (e) {
+    return await spreadFailed(run, work, e)
+  } finally {
+    await retireRenderStage(run, work)
+  }
+}
+
+async function closeRenderSession({ pc, job }) {
+  if (!pc) return
+  try {
+    await pc.close()
+  } catch (error) {
+    job.finishingErrors.push(
+      `The print-sheet processing finished, but PhotoCraft could not finish closing: ${error.message}`,
+    )
+  }
+}
+
 async function runJob(job, { album, ws, projectText, spreads, settings, lease, force, overwriteEdited }, emit) {
   await lease.project.assertOwned()
   const paths = cachePaths(job.outputFolder)
   const previous = await readRenderCacheSnapshot(job.outputFolder, { albumFile: album.file })
-  let cacheRevision = previous.revision,
-    cache = previous.data.version === 2 ? previous.data : { version: 2, spreads: {} }
+  const cacheRevision = previous.revision
+  const cache = previous.data.version === 2 ? previous.data : { version: 2, spreads: {} }
   cache.albumFile = album.file
   const proofDir = path.join(album.path, 'proofs', 'pages')
   await fs.promises.mkdir(proofDir, { recursive: true })
   await fs.promises.mkdir(paths.previews, { recursive: true })
-  let pc = null
-  const results = job.results
+  const run = {
+    job,
+    album,
+    ws,
+    projectText,
+    settings,
+    lease,
+    force,
+    overwriteEdited,
+    emit,
+    paths,
+    proofDir,
+    pc: null,
+    cache,
+    cacheRevision,
+  }
   try {
     for (let i = 0; i < spreads.length; i++) {
       if (job.cancelled) break
-      const s = spreads[i]
-      const name = outputName(s.n)
-      const record = await ownedSheetRecord(ws, album.path, s.id, cache)
-      const existingPath = record && record.path
-      const outPsd = canonicalSheetPath(job.outputFolder, s.id)
-      const report = (state, extra = {}) =>
-        emit('render.progress', { jobId: job.id, index: i + 1, total: job.total, n: s.n, state, ...extra })
-      const t0 = Date.now()
-      let sourceStage = null,
-        privateStage = null,
-        publication = null
-      const privateFiles = new Map()
-      try {
-        await lease.project.assertOwned()
-        if (!s.template || !s.template.file)
-          throw new Error(s.template ? `the template ${s.template.name} isn't on disk` : 'the spread has no template')
-        if (!s.photoIds.length) throw new Error('the spread has no photos')
-        const existingBefore = existingPath ? await fingerprintRenderFile(existingPath) : null
-        const exists = !!existingBefore
-        const sheetBefore = existingPath === outPsd ? existingBefore : await fingerprintRenderFile(outPsd)
-        if (sheetBefore && existingPath !== outPsd)
-          throw new Error(`An unowned sheet exists at ${outPsd}. Preserve it before rendering.`)
-        if (
-          exists &&
-          !overwriteEdited &&
-          (!verifiedSheetRecord(record) || record.sheetDigest !== existingBefore.digest)
-        ) {
-          // Edited by hand in the editor: never replaced without being asked.
-          job.skipped++
-          report('skipped', { reason: 'edited' })
-          results.push({ n: s.n, state: 'skipped', reason: 'edited' })
-          continue
-        }
-        const inputValues = await spreadInputs(s, album, ws)
-        const hash = renderInputHash(inputValues)
-        if (
-          !force &&
-          exists &&
-          entryHash(record) === hash &&
-          (await meetsPrintResolution(existingPath, settings, existingBefore.digest))
-        ) {
-          job.skipped++
-          report('skipped')
-          results.push({ n: s.n, state: 'skipped' })
-          continue
-        }
-        report('preparing')
-        const preflight = await preflightAlbum(
-          album,
-          ws,
-          { ...settings, phase: 'render' },
-          [s.n],
-          new Map([[s.n, inputValues]]),
-        )
-        if (preflight.errors.length) throw new Error(preflight.errors.map((e) => e.message).join(' '))
-        await fs.promises.mkdir(path.dirname(outPsd), { recursive: true })
-        privateStage = await createPrivateStage(paths.dir, 'render-sources-')
-        sourceStage = privateStage.path
-        const stagedPsd = path.join(sourceStage, `${name}.${crypto.randomUUID()}.part.psd`)
-        const preview = path.join(sourceStage, `${name}.${crypto.randomUUID()}.jpg`)
-        const stagedProof = `${stagedPsd}.proof.jpg`
-        const template = await privateStage.snapshot(s.template.file, inputValues[1])
-        privateFiles.set(template, inputValues[1])
-        /** @type {Array<{ file: string, digest: string, orient: 'h' | 'v', name: string, edit: object }>} */
-        const photos = []
-        const warnings = unsupportedEdits(s, ws)
-        for (const id of s.photoIds) {
-          const ph = album.photos[id]
-          if (!ph || !ph.original)
-            throw new Error(`The original photo ${id} is missing; thumbnails cannot be rendered for print.`)
-          const src = ph.original
-          const expectedSource = inputValues[2].find((v) => v[0] === id)[2]
-          const developed = await placeableEvidence(src, paths.raw)
-          if (developed.sourceKey !== contentKey(src, expectedSource))
-            throw new Error('The original changed before its render snapshot was made.')
-          const adjusted = await bakeAdjustmentsEvidence(
-            developed.file,
-            (ws.imageAdjustments || {})[id],
-            paths.adjusted,
-          )
-          if (adjusted.sourceKey !== contentKey(developed.file, developed.digest))
-            throw new Error('The developed image changed before its adjustment snapshot was made.')
-          const frozen = await privateStage.snapshot(adjusted.file, adjusted.digest)
-          privateFiles.set(frozen, adjusted.digest)
-          photos.push({
-            file: frozen,
-            digest: adjusted.digest,
-            orient: ph.orient === 'v' ? 'v' : 'h',
-            name: ph.base,
-            edit: { rotation: (ws.imageRotations || {})[id] || 0, ...((ws.imagePlacements || {})[id] || {}) },
-          })
-        }
-        report('building')
-        if (!pc) pc = new PhotoCraftSession({ writeRoot: job.outputFolder })
-        const built = await buildSheet(pc, {
-          template,
-          photos,
-          layerEdits: (ws.pageLayerEdits || {})[s.n] || null,
-          overlays: (ws.pageOverlays || {})[s.n] || null,
-          outPsd: stagedPsd,
-          outJpg: preview,
-          printSettings: settings,
-        })
-        if (built.warnings.length)
-          throw new Error(`Sheet construction left edits or photos unapplied: ${built.warnings.join('; ')}`)
-        const stagedDigest = await fileDigest(stagedPsd)
-        await privateStage.register(stagedPsd, { digest: stagedDigest })
-        privateFiles.set(stagedPsd, stagedDigest)
-        const previewDigest = await fileDigest(preview)
-        await privateStage.register(preview, { digest: previewDigest })
-        privateFiles.set(preview, previewDigest)
-        const validateSnapshot = async () => {
-          if (
-            (await fs.promises.readFile(album.file, 'utf8')) !== projectText ||
-            (await spreadHash(s, album, ws)) !== hash
-          )
-            throw new Error('The project or source files changed during rendering. Retry from the current revision.')
-          await privateStage.assertFiles()
-          if (
-            (
-              await Promise.all(
-                [...privateFiles]
-                  .filter(([file]) => file !== stagedPsd)
-                  .map(async ([file, expected]) => (await fileDigest(file)) === expected),
-              )
-            ).some((ok) => !ok)
-          ) {
-            throw new Error(
-              `A private render source changed during construction. Preserve ${sourceStage} before retrying.`,
-            )
-          }
-        }
-        const cacheNext = {
-          ...cache,
-          spreads: {
-            ...cache.spreads,
-            [s.id]: {
-              path: outPsd,
-              outputFolder: job.outputFolder,
-              hash,
-              settings,
-              resolutionEvidence: preflight.info.filter((e) => e.code === 'effective_ppi'),
-            },
-          },
-        }
-        const committedWarnings = []
-        try {
-          publication = await publishRender(
-            {
-              albumFile: album.file,
-              outputFolder: job.outputFolder,
-              spreadId: s.id,
-              source: stagedPsd,
-              sourceDigest: stagedDigest,
-              sheetBefore,
-              cacheBefore: cacheRevision,
-              cacheNext,
-              expectedProjectRevision: revisionOf(projectText),
-            },
-            {
-              assertOwned: () => lease.project.assertOwned(),
-              assertOutput: (requested) => lease.project.outputNamespace.assertFor(requested),
-              isCancelled: () => job.cancelled,
-              validateSnapshot,
-            },
-          )
-        } catch (error) {
-          if (
-            !error.renderCommitted ||
-            !error.cache ||
-            !error.cacheRevision ||
-            !error.sheetRecord ||
-            error.sheetRecord.path !== outPsd
-          )
-            throw error
-          publication = error
-          committedWarnings.push(
-            `The print sheet and ownership record were committed. Recovery history needs review: ${error.message}`,
-          )
-        }
-        cache = publication.cache
-        cacheRevision = publication.cacheRevision
-        // Proofs are derived. A failure after durable commit must report the saved sheet,
-        // rather than claim that the render failed or that the old pair was restored.
-        try {
-          await sipsResize(preview, stagedProof, 2400)
-          const proofDigest = await fileDigest(stagedProof)
-          await privateStage.register(stagedProof, { digest: proofDigest })
-          privateFiles.set(stagedProof, proofDigest)
-          await recordSheetProof(album, ws, s, outPsd, {
-            proof: stagedProof,
-            expectedHash: proofInputHash(inputValues),
-            projectText,
-            lease: lease.project,
-          })
-          privateStage.forget(stagedProof)
-          emit('proofs.updated', {
-            album: album.path,
-            n: s.n,
-            proof: path.join(proofDir, `live_page_${String(s.n).padStart(3, '0')}.jpg`),
-            source: 'sheet',
-          })
-        } catch (error) {
-          committedWarnings.push(
-            `The print sheet is saved, but its preview could not be refreshed: ${error.message} Refresh previews after resolving this problem.`,
-          )
-        }
-        job.done++
-        const r = {
-          n: s.n,
-          state: 'done',
-          committed: true,
-          ms: Date.now() - t0,
-          path: outPsd,
-          warnings: [...warnings, ...built.warnings, ...committedWarnings],
-        }
-        results.push(r)
-        report('done', { ms: r.ms, warnings: r.warnings })
-      } catch (e) {
-        if (e.code === 'RENDER_CANCELLED' && !e.recoveryRequired) {
-          results.push({ n: s.n, state: 'cancelled', reason: 'stopped before commit' })
-          report('cancelled', { reason: 'stopped before commit' })
-          break
-        }
-        job.failed++
-        const error = e && e.message ? e.message : String(e)
-        results.push({ n: s.n, state: 'failed', error })
-        report('failed', { error })
-        // A dead engine is replaced for the next sheet; a live one is cleaned up.
-        if (pc && pc.proc.exitCode !== null) pc = null
-        else if (pc) await closeAll(pc)
-      } finally {
-        // Retire the complete capability atomically. Digest-check followed by unlink
-        // cannot protect a name replaced at the final boundary on this filesystem.
-        if (privateStage) {
-          try {
-            await privateStage.cleanup()
-          } catch (error) {
-            job.finishingErrors.push(`Private render work needs review: ${error.message}`)
-          }
-        }
-      }
+      if ((await renderSpread(run, spreads[i], i)) === 'stop') break
     }
   } finally {
-    if (pc) {
-      try {
-        await pc.close()
-      } catch (error) {
-        job.finishingErrors.push(
-          `The print-sheet processing finished, but PhotoCraft could not finish closing: ${error.message}`,
-        )
-      }
-    }
+    await closeRenderSession(run)
   }
-  return results
+  return job.results
 }
 
 /**
