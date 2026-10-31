@@ -22,9 +22,6 @@
   "native/backend/lib/newalbum.js": {
     "complexity": 1
   },
-  "native/backend/lib/parity.js": {
-    "complexity": 2
-  },
   "native/backend/lib/pdf.js": {
     "max-len": 1
   },

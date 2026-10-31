@@ -72,6 +72,84 @@ function agBox(n) {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
 }
 
+async function applyVisibility(pc, { ag, id, step }, edit) {
+  if (edit.hidden === undefined || edit.hidden === !!ag.hidden) return
+  await step('show or hide it', () => pc.run('layer.setProps', { layer: id, visible: !edit.hidden }))
+}
+
+async function applyOpacity(pc, { ag, id, step }, edit) {
+  if (edit.opacity === undefined) return
+  const opacity = typeof ag.opacity === 'number' ? ag.opacity : 1
+  if (Math.abs(edit.opacity - opacity) > 0.001) {
+    await step('change its opacity', () => pc.run('layer.setProps', { layer: id, opacity: edit.opacity }))
+  }
+}
+
+/** The style fields an edit can set: a size above 0, and a colour written as #rrggbb. */
+function styleParams(st, ppi) {
+  const style = {}
+  if (st.sizePx > 0) style.size = +((st.sizePx * 72) / ppi).toFixed(3)
+  if (typeof st.color === 'string' && /^#[0-9a-f]{6}$/i.test(st.color)) style.color = st.color
+  return style
+}
+
+async function applyTextEdits(pc, { ag, id, isText, step, warnings, ppi }, edit) {
+  if (!isText) return
+  if (typeof edit.text === 'string' && edit.text !== ag.text.text) {
+    // The engine keeps the layer's own styles when the copy is replaced.
+    await step('retype it', () => pc.run('type.edit', { layer: id, text: edit.text.replace(/\r\n?/g, '\n') }))
+  }
+  const st = edit.textStyle
+  if (!st) return
+  const style = styleParams(st, ppi)
+  if (Object.keys(style).length) await step('restyle it', () => pc.run('type.setStyle', { layer: id, ...style }))
+  if (st.font)
+    warnings.push(
+      `“${ag.name}”: the font chosen in the spread editor isn't applied yet; the template's own font was kept`,
+    )
+}
+
+async function applyPlacement(pc, { ag, layer, id, isText, step }, edit) {
+  const sx = typeof edit.sx === 'number' ? edit.sx : 1
+  const sy = typeof edit.sy === 'number' ? edit.sy : 1
+  const dx = Number(edit.dx) || 0
+  const dy = Number(edit.dy) || 0
+  if (sx === 1 && sy === 1 && !dx && !dy) return
+  // The editor's box keeps its top-left at the original top-left plus (dx, dy), at w·sx × h·sy.
+  const b = layer.bounds
+    ? { x: layer.bounds[0], y: layer.bounds[1], w: layer.bounds[2], h: layer.bounds[3] }
+    : agBox(ag)
+  if (isText) {
+    await step('move or resize it', async () => {
+      const info = await pc.run('type.info', { layer: id })
+      const [a, bb, c, d, e, f] = info.transform || [1, 0, 0, 1, 0, 0]
+      await pc.run('type.edit', {
+        layer: id,
+        transform: [a * sx, bb * sy, c * sx, d * sy, sx * (e - b.x) + b.x + dx, sy * (f - b.y) + b.y + dy],
+      })
+    })
+  } else if (sx === 1 && sy === 1) {
+    await step('move it', () => pc.run('layer.translate', { layer: id, dx: Math.round(dx), dy: Math.round(dy) }))
+  } else {
+    const x0 = b.x + dx
+    const y0 = b.y + dy
+    const x1 = x0 + b.w * sx
+    const y1 = y0 + b.h * sy
+    await step('move or resize it', () =>
+      pc.run('edit.transform', {
+        layer: id,
+        rect: [b.x, b.y, b.x + b.w, b.y + b.h],
+        quad: [
+          [x0, y0],
+          [x1, y0],
+          [x1, y1],
+          [x0, y1],
+        ],
+      }),
+    )
+  }
+}
+
 /**
  * Apply `layerEdits` (the editor's overrides for this page) to the open template.
  * @returns {Promise<string[]>} warnings
@@ -92,8 +170,6 @@ async function applyLayerEdits(pc, templatePath, layerEdits) {
       continue
     }
     const { ag, pc: layer } = pair
-    const id = layer.id
-    const isText = !!ag.text
     const step = async (what, fn) => {
       try {
         await fn()
@@ -101,70 +177,11 @@ async function applyLayerEdits(pc, templatePath, layerEdits) {
         warnings.push(`“${ag.name}”: couldn't ${what} (${msg(e)})`)
       }
     }
-    if (edit.hidden !== undefined && edit.hidden === !!ag.hidden) {
-      /* already so in the template */
-    } else if (edit.hidden !== undefined) {
-      await step('show or hide it', () => pc.run('layer.setProps', { layer: id, visible: !edit.hidden }))
-    }
-    if (
-      edit.opacity !== undefined &&
-      Math.abs(edit.opacity - (typeof ag.opacity === 'number' ? ag.opacity : 1)) > 0.001
-    ) {
-      await step('change its opacity', () => pc.run('layer.setProps', { layer: id, opacity: edit.opacity }))
-    }
-    if (isText && typeof edit.text === 'string' && edit.text !== ag.text.text) {
-      // The engine keeps the layer's own styles when the copy is replaced.
-      await step('retype it', () => pc.run('type.edit', { layer: id, text: edit.text.replace(/\r\n?/g, '\n') }))
-    }
-    if (isText && edit.textStyle) {
-      const st = edit.textStyle
-      const style = {}
-      if (st.sizePx > 0) style.size = +((st.sizePx * 72) / ppi).toFixed(3)
-      if (typeof st.color === 'string' && /^#[0-9a-f]{6}$/i.test(st.color)) style.color = st.color
-      if (Object.keys(style).length) await step('restyle it', () => pc.run('type.setStyle', { layer: id, ...style }))
-      if (st.font)
-        warnings.push(
-          `“${ag.name}”: the font chosen in the spread editor isn't applied yet; the template's own font was kept`,
-        )
-    }
-    const sx = typeof edit.sx === 'number' ? edit.sx : 1
-    const sy = typeof edit.sy === 'number' ? edit.sy : 1
-    const dx = Number(edit.dx) || 0
-    const dy = Number(edit.dy) || 0
-    if (sx === 1 && sy === 1 && !dx && !dy) continue
-    // The editor's box keeps its top-left at the original top-left plus (dx, dy), at w·sx × h·sy.
-    const b = layer.bounds
-      ? { x: layer.bounds[0], y: layer.bounds[1], w: layer.bounds[2], h: layer.bounds[3] }
-      : agBox(ag)
-    if (isText) {
-      await step('move or resize it', async () => {
-        const info = await pc.run('type.info', { layer: id })
-        const [a, bb, c, d, e, f] = info.transform || [1, 0, 0, 1, 0, 0]
-        await pc.run('type.edit', {
-          layer: id,
-          transform: [a * sx, bb * sy, c * sx, d * sy, sx * (e - b.x) + b.x + dx, sy * (f - b.y) + b.y + dy],
-        })
-      })
-    } else if (sx === 1 && sy === 1) {
-      await step('move it', () => pc.run('layer.translate', { layer: id, dx: Math.round(dx), dy: Math.round(dy) }))
-    } else {
-      const x0 = b.x + dx
-      const y0 = b.y + dy
-      const x1 = x0 + b.w * sx
-      const y1 = y0 + b.h * sy
-      await step('move or resize it', () =>
-        pc.run('edit.transform', {
-          layer: id,
-          rect: [b.x, b.y, b.x + b.w, b.y + b.h],
-          quad: [
-            [x0, y0],
-            [x1, y0],
-            [x1, y1],
-            [x0, y1],
-          ],
-        }),
-      )
-    }
+    const target = { ag, layer, id: layer.id, isText: !!ag.text, step, warnings, ppi }
+    await applyVisibility(pc, target, edit)
+    await applyOpacity(pc, target, edit)
+    await applyTextEdits(pc, target, edit)
+    await applyPlacement(pc, target, edit)
   }
   return warnings
 }
@@ -175,14 +192,89 @@ async function topLayerId(pc) {
   return doc.layers && doc.layers[0] ? doc.layers[0].id : null
 }
 
+/** Move a layer above the top of the stack, unless it's there already. */
+async function moveToTop(pc, id) {
+  const top = await topLayerId(pc)
+  if (top !== null && top !== id) await pc.run('layer.moveTo', { layer: id, target: top, position: 'above' })
+}
+
+/** Draw the page's shapes to one PNG and copy that into the sheet as a named layer. */
+async function addShapes(pc, overlays, rasterizeOverlays, { width, height, tplIdx }, warnings) {
+  let png = null
+  try {
+    png = await rasterizeOverlays(overlays, width, height)
+    if (png) {
+      await pc.call('doc.open', { path: PhotoCraftSession.readPath(png) })
+      const idx = (await pc.call('session.list', {})).active
+      const copied = await pc.run('layer.copyToDocument', { document: tplIdx })
+      await pc.call('doc.close', { index: idx })
+      await pc.call('doc.select', { index: tplIdx })
+      const id = copied.layers[0]
+      await pc.run('layer.renameLayer', { layer: id, name: 'Album Studio — text & shapes' })
+      await moveToTop(pc, id)
+    }
+  } catch (e) {
+    warnings.push(`the shapes added in the spread editor couldn't be placed (${msg(e)})`)
+  } finally {
+    if (png) await fs.promises.unlink(png).catch(() => {})
+  }
+}
+
+function typeParams(t, name, ppi) {
+  return {
+    x: t.anchorX,
+    y: t.firstBaseline,
+    text: t.lines.join('\n'),
+    name,
+    align: t.align === 'center' || t.align === 'right' ? t.align : 'left',
+    font: t.font,
+    weight: t.weight,
+    italic: !!t.italic,
+    size: +((t.fontSize * 72) / ppi).toFixed(3),
+    leading: +((t.lineStep * 72) / ppi).toFixed(3),
+    tracking: Math.round((t.trackingEm || 0) * 1000),
+    color: /^#[0-9a-f]{6}/i.test(String(t.color)) ? String(t.color).slice(0, 7) : '#111111',
+    underline: !!t.underline,
+  }
+}
+
+/**
+ * Turn about the editor's box centre, as the preview does: the anchor moves round the pivot and
+ * the type turns with it.
+ */
+async function turnType(pc, id, t) {
+  const r = (t.rot * Math.PI) / 180
+  const cos = Math.cos(r)
+  const sin = Math.sin(r)
+  const ax = t.anchorX - t.cx
+  const ay = t.firstBaseline - t.cy
+  await pc.run('type.edit', {
+    layer: id,
+    transform: [cos, sin, -sin, cos, t.cx + ax * cos - ay * sin, t.cy + ax * sin + ay * cos],
+  })
+}
+
+async function addTextOverlay(pc, t, ppi, warnings) {
+  const name = (t.lines[0] || 'Text').slice(0, 40)
+  try {
+    const made = await pc.run('type.create', typeParams(t, name, ppi))
+    const id = made.layer
+    if (t.opacity < 1) await pc.run('layer.setProps', { layer: id, opacity: t.opacity })
+    if (t.rot) await turnType(pc, id, t)
+    await moveToTop(pc, id)
+  } catch (e) {
+    warnings.push(`the text “${name}” couldn't be added (${msg(e)})`)
+  }
+}
+
 /**
  * Add the page's text and shapes on top of the sheet.
  * @param {PhotoCraftSession} pc
  * @param {any[] | null | undefined} overlays   the page's overlays as the editor stores them
- * @param {{ width: number, height: number, tplIdx: number }} doc
+ * @param {{ width: number, height: number, tplIdx: number }} page
  * @returns {Promise<string[]>} warnings
  */
-async function addOverlays(pc, overlays, { width, height, tplIdx }) {
+async function addOverlays(pc, overlays, page) {
   const warnings = []
   if (!Array.isArray(overlays) || !overlays.some((o) => o && !o.hidden)) return warnings
   const { resolveTextLayout } = require('../../../src/overlay_render')
@@ -191,71 +283,13 @@ async function addOverlays(pc, overlays, { width, height, tplIdx }) {
   const ppi = Number((await pc.call('doc.inspect', {})).resolution) || 72
 
   // Shapes first, as one layer (text sits above it, as in the Photoshop build).
-  if (hasShapeOverlays(overlays)) {
-    let png = null
-    try {
-      png = await rasterizeOverlays(overlays, width, height)
-      if (png) {
-        await pc.call('doc.open', { path: PhotoCraftSession.readPath(png) })
-        const idx = (await pc.call('session.list', {})).active
-        const copied = await pc.run('layer.copyToDocument', { document: tplIdx })
-        await pc.call('doc.close', { index: idx })
-        await pc.call('doc.select', { index: tplIdx })
-        const id = copied.layers[0]
-        await pc.run('layer.renameLayer', { layer: id, name: 'Album Studio — text & shapes' })
-        const top = await topLayerId(pc)
-        if (top !== null && top !== id) await pc.run('layer.moveTo', { layer: id, target: top, position: 'above' })
-      }
-    } catch (e) {
-      warnings.push(`the shapes added in the spread editor couldn't be placed (${msg(e)})`)
-    } finally {
-      if (png) await fs.promises.unlink(png).catch(() => {})
-    }
-  }
+  if (hasShapeOverlays(overlays)) await addShapes(pc, overlays, rasterizeOverlays, page, warnings)
 
   // Text as live type, bottom to top in the editor's order.
   for (const L of overlays) {
     if (!L || L.hidden || L.type !== 'text') continue
-    const t = resolveTextLayout(L, width, height)
-    if (!t) continue
-    const name = (t.lines[0] || 'Text').slice(0, 40)
-    try {
-      const params = {
-        x: t.anchorX,
-        y: t.firstBaseline,
-        text: t.lines.join('\n'),
-        name,
-        align: t.align === 'center' || t.align === 'right' ? t.align : 'left',
-        font: t.font,
-        weight: t.weight,
-        italic: !!t.italic,
-        size: +((t.fontSize * 72) / ppi).toFixed(3),
-        leading: +((t.lineStep * 72) / ppi).toFixed(3),
-        tracking: Math.round((t.trackingEm || 0) * 1000),
-        color: /^#[0-9a-f]{6}/i.test(String(t.color)) ? String(t.color).slice(0, 7) : '#111111',
-        underline: !!t.underline,
-      }
-      const made = await pc.run('type.create', params)
-      const id = made.layer
-      if (t.opacity < 1) await pc.run('layer.setProps', { layer: id, opacity: t.opacity })
-      if (t.rot) {
-        // Turn about the editor's box centre, as the preview does: the anchor moves round the
-        // pivot and the type turns with it.
-        const r = (t.rot * Math.PI) / 180
-        const cos = Math.cos(r)
-        const sin = Math.sin(r)
-        const ax = t.anchorX - t.cx
-        const ay = t.firstBaseline - t.cy
-        await pc.run('type.edit', {
-          layer: id,
-          transform: [cos, sin, -sin, cos, t.cx + ax * cos - ay * sin, t.cy + ax * sin + ay * cos],
-        })
-      }
-      const top = await topLayerId(pc)
-      if (top !== null && top !== id) await pc.run('layer.moveTo', { layer: id, target: top, position: 'above' })
-    } catch (e) {
-      warnings.push(`the text “${name}” couldn't be added (${msg(e)})`)
-    }
+    const t = resolveTextLayout(L, page.width, page.height)
+    if (t) await addTextOverlay(pc, t, ppi, warnings)
   }
   return warnings
 }
