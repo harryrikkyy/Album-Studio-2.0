@@ -60,6 +60,7 @@ for (const [name, selected] of [
   ['a repeat', [1, 1]],
   ['a fraction', [1.5]],
   ['an unknown spread', [9]],
+  ['a number', 1],
 ]) {
   test(`a selection of ${name} is refused`, async (t) => {
     const f = await fixture(t)
@@ -961,5 +962,103 @@ test('one album breaking many rules reports them in order', async (t) => {
       ['effective_ppi_policy', undefined],
       ['effective_ppi', 'photoA'],
     ],
+  )
+})
+
+// ─── Two rules at once ───────────────────────────────
+
+// Each album breaks two rules, so swapping the two checks changes the list or its message.
+
+test('a frame with no photo is named ahead of a photo below the policy', async (t) => {
+  const f = await fixture(t, { frames: [frame(), SECOND] })
+  assert.deepEqual(codes(await run(f, { minEffectivePpi: 100000 })), ['frame_unfilled', 'low_effective_ppi'])
+})
+
+test('a low resolution is named ahead of a rotated photo that falls short', async (t) => {
+  const f = await fixture(t)
+  f.workspace.imageRotations.photoA = 45
+  assert.deepEqual(codes(await run(f, { minEffectivePpi: 100000 })), ['low_effective_ppi', 'frame_coverage'])
+})
+
+test('a moved group is named ahead of a font change on it', async (t) => {
+  const inner = { name: 'Inner', left: 10, top: 10, right: 20, bottom: 20, imageData: pixels(10, 10) }
+  const group = { name: 'Group', left: 10, top: 10, right: 20, bottom: 20, children: [inner] }
+  const f = await fixture(t, { frames: [frame(), group] })
+  f.workspace.pageLayerEdits[1] = { 1: { dx: 5, textStyle: { font: 'Arial' } } }
+  assert.deepEqual(codes(await run(f)), ['layer_geometry_unverified', 'unsupported_edit'])
+})
+
+test('inputs that can’t be read end the spread ahead of an identity conflict', async (t) => {
+  const f = await fixture(t)
+  f.album.identityConflicts = [{ n: 1 }]
+  f.album.photos.photoA.original = f.root
+  assert.deepEqual(codes(await run(f)), ['source_changed'])
+})
+
+test('an identity conflict is named ahead of a missing template', async (t) => {
+  const f = await fixture(t)
+  const inputs = await inputsOf(f)
+  f.album.identityConflicts = [{ n: 1 }]
+  fs.rmSync(f.template)
+  assert.deepEqual(codes(await given(f, inputs)), ['identity_conflict', 'template_missing'])
+})
+
+test('a print size that can’t be made ends the spread ahead of the lab’s dimensions', async (t) => {
+  const f = await fixture(t)
+  f.workspace.printSpec = { widthInches: 3, heightInches: 1, profile: 'sRGB' }
+  assert.deepEqual(codes(await run(f, { heightInches: 100000 })), ['print_settings_invalid'])
+})
+
+test('a changed template is reported as changed, not as unreadable', async (t) => {
+  const f = await fixture(t)
+  const inputs = await inputsOf(f)
+  fs.writeFileSync(f.template, 'not a psd at all, and not what was digested')
+  assert.deepEqual(messages(await given(f, inputs)), [
+    'Spread 1: The template changed before its verified geometry could be decoded.',
+  ])
+})
+
+test('a template changed during the checks is named ahead of a changed photo', async (t) => {
+  const { check } = watched({ './cache': { ...cache, fileDigest: async () => 'changed' } })
+  const f = await fixture(t)
+  assert.deepEqual(messages(await check(f)), [
+    "Spread 1's print inputs changed during verification: the template changed",
+  ])
+})
+
+test('a changed original is named ahead of a developed file that can’t be read', async (t) => {
+  const placeableEvidence = async () => ({ file: '/gone.jpg', digest: 'x', sourceKey: 'another revision' })
+  const { check } = watched({ './raw': { ...raw, placeableEvidence } })
+  const f = await fixture(t)
+  assert.deepEqual(messages(await check(f)), [
+    'Spread 1: Original cannot be fully decoded (The original changed before its print metadata could be verified.).',
+  ])
+})
+
+test('an adjustment the printer can’t make is named ahead of a corrupt photo', async (t) => {
+  const f = await fixture(t)
+  f.workspace.imageAdjustments.photoA = { curves: true }
+  fs.writeFileSync(f.album.photos.photoA.original, Buffer.alloc(100))
+  assert.deepEqual(codes(await run(f)), ['unsupported_edit', 'photo_corrupt'])
+})
+
+// ─── Names in the messages ──────────────────────────────
+
+test('a photo below the policy goes by its name', async (t) => {
+  const f = await fixture(t)
+  f.album.photos.photoA.base = 'Kept name'
+  const report = await run(f, { minEffectivePpi: 100000 })
+  assert.deepEqual(messages(report), ['Spread 1: Kept name is below the 100000 PPI policy (375.0).'])
+  assert.equal(measured(report).message, 'Kept name: 375.0 effective PPI.')
+})
+
+test('a missing original goes by its photo’s name', async (t) => {
+  const f = await fixture(t)
+  f.album.photos.photoA.base = 'Kept name'
+  const inputs = await inputsOf(f)
+  fs.rmSync(f.album.photos.photoA.original)
+  assert.equal(
+    messages(await given(f, inputs))[0],
+    'Spread 1: original for Kept name is missing; thumbnails cannot be printed.',
   )
 })
